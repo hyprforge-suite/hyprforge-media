@@ -27,9 +27,9 @@ wallpaper settings the Settings app's Desktop screen edits, so the two
 never disagree.
 
 Part of [Hyprforge](https://github.com/hyprforge-suite/hyprforge), a suite of
-native Hyprland desktop applications. This repository is a split of the
-`crates/hyprforge-media` directory there; development happens in the
-monorepo and `sync.sh` keeps this copy in step.
+native Hyprland desktop applications. It appears there as a
+submodule at `crates/hyprforge-media`; this repository is where its code
+lives, and pull requests here are welcome.
 
 ## What is here
 
