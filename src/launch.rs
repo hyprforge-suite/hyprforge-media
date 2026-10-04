@@ -46,20 +46,27 @@ pub fn open_with(entry: &Path, file: &Path) -> Result<(), String> {
     })
 }
 
-/// Opens the file manager on `file`'s folder.
+/// Opens the file manager on `file`'s folder, with the picture selected.
 ///
-/// The file manager opens the folder containing a file it is handed —
-/// its own `resolve_start_dir` — so the picture's path is passed as-is.
-/// Not installed is a sentence, never a failure of the viewer: every
-/// component runs alone.
+/// `--select` is the file manager's "show this item" — what
+/// `org.freedesktop.FileManager1.ShowItems` runs too — so the picture is
+/// the row the keyboard is on when the window opens, not merely
+/// somewhere in its folder. `--` keeps a path from ever being read as an
+/// option. Not installed is a sentence, never a failure of the viewer:
+/// every component runs alone.
 pub fn show_in_files(file: &Path) -> Result<(), String> {
-    spawn(Command::new("hyprforge-files").arg(file)).map_err(|e| {
+    spawn(Command::new("hyprforge-files").args(show_in_files_args(file))).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "Hyprforge Files isn't installed, so there's nothing to show the folder in.".to_string()
         } else {
             format!("Couldn't open the file manager: {e}")
         }
     })
+}
+
+/// The file manager's arguments for [`show_in_files`].
+fn show_in_files_args(file: &Path) -> [&std::ffi::OsStr; 3] {
+    ["--select".as_ref(), "--".as_ref(), file.as_os_str()]
 }
 
 fn spawn(command: &mut Command) -> std::io::Result<()> {
@@ -130,6 +137,14 @@ mod tests {
             path: PathBuf::from(format!("/usr/share/applications/{id}")),
             installed,
         }
+    }
+
+    /// Shown *selected* in its folder, and never mistaken for an option
+    /// however it is named.
+    #[test]
+    fn show_in_files_asks_for_the_picture_selected() {
+        let args = show_in_files_args(Path::new("/p/--odd.png"));
+        assert_eq!(args.map(|a| a.to_str().unwrap()), ["--select", "--", "/p/--odd.png"]);
     }
 
     #[test]
