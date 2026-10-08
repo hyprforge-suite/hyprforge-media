@@ -37,9 +37,9 @@ A library as well as an application. Every *decision* — what is in the
 folder, what is next, how a picture fits the window, what a key means,
 which tiles a date heading groups, what the slideshow shows next — lives
 under `src/lib.rs` where a test can reach it without a display. The
-window itself is `src/main.rs` and `src/view.rs`, with `src/film.rs`
-drawing a playing video's frames and `src/model/` a 3D model on the GPU,
-and is deliberately thin.
+window itself is `src/main.rs` and `src/view.rs`, deliberately thin; a
+playing video and a 3D model on the GPU are `hyprforge-viewer`'s panes,
+shared with Files' Quick Look.
 
 ## Installing
 

@@ -389,43 +389,15 @@ impl App {
         };
         let Some(item) = self.folder.current() else { return centred(String::new()) };
         let body: Element<'_, Message> = match &self.model {
+            // The model pane draws it and takes the drags — see
+            // `hyprforge_viewer::model_pane`, which Files' Quick Look shares.
             Some(model) if model.path == item.path => {
-                let program = super::model::ModelProgram {
-                    mesh: model.mesh.clone(),
-                    generation: model.generation,
-                    camera: model.camera,
-                    style: super::model::Style {
-                        draw_mode: self.prefs.model_draw_mode(),
-                        axes: self.prefs.model_axes,
-                        backdrop: surface::root(),
-                    },
+                let style = hyprforge_viewer::model::Style {
+                    draw_mode: self.prefs.model_draw_mode(),
+                    axes: self.prefs.model_axes,
+                    backdrop: surface::root(),
                 };
-                let scene = mouse_area(
-                    iced::widget::shader(program)
-                        .width(Length::Fixed(viewport.width))
-                        .height(Length::Fixed(viewport.height)),
-                )
-                .on_press(Message::ModelPress(super::ModelDrag::Turn))
-                .on_release(Message::ModelRelease)
-                .on_right_press(Message::ModelPress(super::ModelDrag::Pan))
-                .on_right_release(Message::ModelRelease)
-                .on_move(Message::ModelPointer)
-                .on_scroll(Message::ModelScrolled)
-                .interaction(if self.model_drag.is_some() {
-                    iced::mouse::Interaction::Grabbing
-                } else {
-                    iced::mouse::Interaction::Grab
-                });
-                // Behind the scene, and covered by its backdrop whenever
-                // wgpu is drawing — see `model`'s module doc.
-                let fallback = container(meta_text(
-                    "3D models need GPU rendering, and this window is drawing without it.",
-                    BASE_TEXT_SIZE,
-                    scale,
-                ))
-                .center(Length::Fill)
-                .style(|_t: &Theme| plane(surface::root()));
-                stack![fallback, scene].into()
+                model.pane.view(iced::Size::new(viewport.width, viewport.height), style, scale).map(Message::Model)
             }
             _ => match self.failed.get(&item.path) {
                 Some(e) => centred(e.clone()),
@@ -465,37 +437,18 @@ impl App {
                 .into()
         };
         let Some(item) = self.folder.current() else { return centred(String::new()) };
-        let video = self.video.as_ref().filter(|v| v.path == item.path);
+        let video = self.video.as_ref().filter(|v| v.path() == item.path);
+        // The video pane draws the picture — see `hyprforge_viewer::video`,
+        // which Files' Quick Look shares.
         let body: Element<'_, Message> = match video {
-            Some(v) if v.error.is_some() && v.frame.is_none() => centred(v.error.clone().unwrap_or_default()),
-            Some(v) => match &v.frame {
-                // Not before the video's shape is known: until then mpv
-                // draws black pre-roll frames the size of the pane, and a
-                // black pane reads as a broken video.
-                Some((frame, serial)) if v.playback.video_size.is_some_and(|(w, h)| w > 0 && h > 0) => {
-                    let root = surface::root();
-                    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let film = iced::widget::shader(super::film::FilmProgram {
-                        frame: frame.clone(),
-                        serial: *serial,
-                        backdrop: [byte(root.r), byte(root.g), byte(root.b), 255],
-                    })
-                    .width(Length::Fixed(viewport.width))
-                    .height(Length::Fixed(viewport.height));
-                    // Behind the film, for iced's software renderer, where
-                    // a shader draws nothing; with the GPU the film's own
-                    // backdrop covers it — see `film`'s module doc.
-                    let fallback = centred("Videos need GPU rendering, and this window is drawing without it.".to_string());
-                    mouse_area(stack![fallback, film])
-                        .on_press(Message::Perform(Action::PlayPause))
-                        .on_move(Message::PointerMoved)
-                        .into()
-                }
-                _ => centred(format!("Loading {}…", item.name)),
+            Some(v) if v.error().is_some() && !v.has_picture() => centred(v.error().unwrap_or_default().to_string()),
+            Some(v) => match v.film(iced::Size::new(viewport.width, viewport.height), scale) {
+                Some(film) => mouse_area(film.map(Message::Video)).on_move(Message::PointerMoved).into(),
+                None => centred(format!("Loading {}…", item.name)),
             },
             None => centred(format!("Loading {}…", item.name)),
         };
-        let Some(v) = video.filter(|v| controls && v.player.is_some()) else {
+        let Some(v) = video.filter(|v| controls && v.playing()) else {
             return container(body).width(Length::Fixed(viewport.width)).height(Length::Fixed(viewport.height)).into();
         };
         let arrows = container(
@@ -509,58 +462,8 @@ impl App {
         .center_y(Length::Fill)
         .width(Length::Fill)
         .padding([0, 14]);
-        let bar = container(self.video_bar(v)).center_x(Length::Fill).align_bottom(Length::Fill).padding([12, 14]);
+        let bar = container(v.bar(scale).map(Message::Video)).center_x(Length::Fill).align_bottom(Length::Fill).padding([12, 14]);
         stack![body, arrows, bar].width(Length::Fixed(viewport.width)).height(Length::Fixed(viewport.height)).into()
-    }
-
-    /// Play, the clock, the seek bar, mute.
-    fn video_bar<'a>(&'a self, v: &'a super::VideoView) -> Element<'a, Message> {
-        let scale = self.font_scale;
-        let p = &v.playback;
-        let duration = p.duration.unwrap_or(0.0);
-        let at = self.seeking.map_or(p.position, |s| s.target).min(duration.max(0.0));
-        let play_label = if p.ended {
-            "↺"
-        } else if p.paused {
-            "▶"
-        } else {
-            "❚❚"
-        };
-        let small = |label: &'static str, message: Message, lit: bool| -> Element<'a, Message> {
-            button(text(label).size(scale.apply(density::META_TEXT_BASE)))
-                .padding([3.0, 10.0])
-                .on_press(message)
-                .style(segment_style(SegmentLook::Quiet, lit))
-                .into()
-        };
-        let clock = text(format!("{} / {}", info::clock(at), info::clock(duration)))
-            .font(theme::mono_font())
-            .size(scale.apply(density::META_TEXT_BASE * 0.85))
-            .color(theme::text_dim());
-        let seek: Element<'a, Message> = if duration > 0.0 {
-            iced::widget::slider(0.0..=duration, at, Message::SeekTo)
-                .step(0.1)
-                .on_release(Message::SeekRelease)
-                .style(hyprforge_ui::widgets::slider_style)
-                .width(Length::Fill)
-                .into()
-        } else {
-            Space::new().width(Length::Fill).into()
-        };
-        container(
-            row![
-                small(play_label, Message::Perform(Action::PlayPause), false),
-                clock,
-                seek,
-                small(if p.muted { "Muted" } else { "Sound" }, Message::Perform(Action::ToggleMute), p.muted),
-            ]
-            .spacing(spacing::SM)
-            .align_y(iced::Alignment::Center),
-        )
-        .padding([4, 8])
-        .max_width(scale.apply(720.0))
-        .style(|_t: &Theme| floating())
-        .into()
     }
 
     /// The model's counterpart of the zoom pill: the five draw modes, then
@@ -903,7 +806,7 @@ impl App {
                 let model = self.model.as_ref().filter(|m| m.path == item.path).map(|m| &m.facts);
                 let mut sections = info::sections(item, measured, camera, model, turns, self.current_bytes);
                 if item.media == Media::Clip {
-                    let playback = self.video.as_ref().filter(|v| v.path == item.path).map(|v| &v.playback);
+                    let playback = self.video.as_ref().filter(|v| v.path() == item.path).map(|v| v.playback());
                     sections.extend(info::video_section(
                         playback.and_then(|p| p.duration),
                         playback.and_then(|p| p.video_size),
@@ -957,7 +860,7 @@ impl App {
             match self.mode {
                 Mode::Photo => {
                     if let Some(item) = self.folder.current().filter(|i| i.media == Media::Clip) {
-                        let playback = self.video.as_ref().filter(|v| v.path == item.path).map(|v| &v.playback);
+                        let playback = self.video.as_ref().filter(|v| v.path() == item.path).map(|v| v.playback());
                         left = left.push(meta_text(
                             info::video_status_line(
                                 item,

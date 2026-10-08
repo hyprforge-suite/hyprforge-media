@@ -37,8 +37,6 @@
 //! at [`MAX_THUMBS`]. A folder of four thousand photographs costs what a
 //! screenful of tiles costs.
 
-mod film;
-mod model;
 mod view;
 
 use hyprforge_image::{decode_to_fit, Budget, Camera, Decoded, Measured, ViewportPixels};
@@ -50,7 +48,9 @@ use hyprforge_media::history::History;
 use hyprforge_media::keys::{Action, Resolved};
 use hyprforge_media::library::Summary;
 use hyprforge_media::rotation::{rotate_rgba, Turns};
-use hyprforge_mesh::camera::{Camera as ModelCamera, ViewPoint};
+use hyprforge_mesh::camera::ViewPoint;
+use hyprforge_viewer::model_pane::{Loaded as LoadedModel, ModelMessage, ModelPane};
+use hyprforge_viewer::video::{VideoMessage, VideoPane};
 use hyprforge_mesh::style::DrawMode;
 use hyprforge_media::slideshow::{Interval, Show};
 use hyprforge_media::transform::{ImageSize, LogicalPoint, Transform, Viewport};
@@ -107,9 +107,6 @@ const PIXELS_PER_ZOOM_STEP: f32 = 60.0;
 /// `stat` a second of one path costs nothing and needs no watcher — the
 /// file manager polls the files it opened out of archives the same way.
 const MODEL_CHECK_EVERY: Duration = Duration::from_secs(1);
-/// Scroll units per wheel notch for the model camera, which counts in
-/// view3d's (egui's) points; iced's `Lines` are notches.
-const MODEL_UNITS_PER_LINE: f32 = 50.0;
 /// How long a slideshow's controls stay up after the pointer stops —
 /// mockup `1e`'s "controls fade after 2 s".
 const SLIDESHOW_CONTROLS_FOR: Duration = Duration::from_secs(2);
@@ -228,14 +225,12 @@ fn main() -> iced::Result {
         model: None,
         model_loading: None,
         model_generation: 0,
-        model_drag: None,
         compact,
         float_picture,
         floated: false,
         planned_float,
         video: None,
         video_generation: 0,
-        seeking: None,
         thumb_cache: hyprforge_thumbnails::Cache::standard().map(Arc::new),
         notice: problems.first().cloned(),
         undo: None,
@@ -348,44 +343,15 @@ enum Listing {
 /// held — moving to anything else drops it, mesh and GPU copy both.
 struct ModelView {
     path: PathBuf,
-    mesh: Arc<hyprforge_mesh::Mesh>,
+    /// The mesh, its camera and the hands on it — shared with Files' Quick
+    /// Look, see `hyprforge_viewer::model_pane`.
+    pane: ModelPane,
     facts: hyprforge_media::info::ModelFacts,
-    generation: u64,
-    camera: ModelCamera,
     /// A file that loaded but not entirely — an OBJ whose materials could
     /// not be read, drawn uncoloured.
     warning: Option<String>,
     /// The file's time when it was read, for autoreload.
     modified: Option<std::time::SystemTime>,
-}
-
-/// Where the seek bar is being held, or was let go.
-///
-/// Held after release too, until mpv reports a position near it: the
-/// player's last report is from before the seek, and showing it would
-/// snap the handle back for a moment before it jumped forward again.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Seeking {
-    target: f64,
-    dragging: bool,
-    since: Instant,
-}
-
-/// How close mpv's reported position must come to where the bar was let
-/// go before the bar follows mpv again, and how long it waits at most.
-const SEEK_SETTLE_SECONDS: f64 = 0.75;
-const SEEK_SETTLE_WAIT: Duration = Duration::from_millis(1500);
-
-/// A video in the pane.
-struct VideoView {
-    path: PathBuf,
-    generation: u64,
-    /// `None` when it could not start — `error` says why.
-    player: Option<hyprforge_video::Player>,
-    /// The latest frame and its serial, drawn by `film::FilmProgram`.
-    frame: Option<(Arc<hyprforge_video::Frame>, u64)>,
-    playback: hyprforge_video::Playback,
-    error: Option<String>,
 }
 
 /// Thumbnails that cost a process or a mesh load are made a few at a time,
@@ -399,32 +365,6 @@ static EXPENSIVE_THUMBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_
 struct Compact {
     sidebar: bool,
     info: bool,
-}
-
-/// Which way a drag on a model moves the camera.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelDrag {
-    Turn,
-    Pan,
-}
-
-/// A loaded mesh on its way from the blocking pool to the window. By hand
-/// rather than derived, so a `Debug` of the message is a line and not every
-/// vertex of the model.
-#[derive(Clone)]
-struct LoadedModel {
-    mesh: Arc<hyprforge_mesh::Mesh>,
-    warning: Option<String>,
-    modified: Option<std::time::SystemTime>,
-    /// Read with `modified`, so a reload's size is the new file's and not
-    /// the listing's from before it changed.
-    bytes: Option<u64>,
-}
-
-impl std::fmt::Debug for LoadedModel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LoadedModel({} triangles)", self.mesh.tri_count())
-    }
 }
 
 /// A slideshow in progress.
@@ -503,8 +443,6 @@ struct App {
     /// than reading the file twice.
     model_loading: Option<PathBuf>,
     model_generation: u64,
-    /// The drag in progress on a model, and where the pointer last was.
-    model_drag: Option<(ModelDrag, Point)>,
     /// `Some` while the window is the compact viewer a picture opened on
     /// its own gets: which of the two panels the user has asked for since.
     /// Showing Grid or Library ends it — that is when the panels are
@@ -519,11 +457,11 @@ struct App {
     planned_float: Option<(u32, u32)>,
     /// The video on screen and its player. Only the current item's — any
     /// other item drops it, which stops the sound.
-    video: Option<VideoView>,
+    /// The video on screen — the player shared with Files' Quick Look,
+    /// see `hyprforge_viewer::video`.
+    video: Option<VideoPane>,
     /// Bumped per player, so updates from one already dropped are ignored.
     video_generation: u64,
-    /// Where the seek bar is being dragged to, until it is let go.
-    seeking: Option<Seeking>,
     /// The shared freedesktop cache, for video frames and model drawings.
     thumb_cache: Option<Arc<hyprforge_thumbnails::Cache>>,
     /// One line in the status bar: a problem to report, or what just
@@ -570,19 +508,14 @@ enum Message {
     /// A model read from disk; `true` when it replaces the one on screen
     /// after its file changed, keeping the view.
     ModelLoaded(PathBuf, bool, Result<LoadedModel, String>),
-    ModelPress(ModelDrag),
-    ModelRelease,
-    ModelPointer(Point),
-    ModelScrolled(mouse::ScrollDelta),
+    /// For the model pane — a drag, the pointer, the wheel.
+    Model(ModelMessage),
     CheckModelFile,
     SetDrawMode(DrawMode),
     /// The window floated (or did not) — logged, never shown.
     Floated(Result<(), String>),
-    /// Something from the player numbered `u64`.
-    Video(u64, hyprforge_video::Update),
-    /// The seek bar dragged to a point, and let go.
-    SeekTo(f64),
-    SeekRelease,
+    /// For the video pane — the player's reports, the bar, a click.
+    Video(VideoMessage),
     SlideshowPause,
     SlideshowShuffle,
     SlideshowLoop,
@@ -791,54 +724,9 @@ impl App {
                     None => float,
                 }
             }
-            Message::Video(generation, update) => {
-                let Some(video) = self.video.as_mut().filter(|v| v.generation == generation) else {
-                    return Task::none();
-                };
-                match update {
-                    hyprforge_video::Update::Frame(frame) => {
-                        let serial = video.frame.as_ref().map_or(0, |(_, s)| s + 1);
-                        video.frame = Some((frame, serial));
-                    }
-                    hyprforge_video::Update::Playback(playback) => {
-                        // Width and height arrive as separate properties,
-                        // so "known" means both — (1280, 0) is not a shape.
-                        let shaped = |p: &hyprforge_video::Playback| p.video_size.is_some_and(|(w, h)| w > 0 && h > 0);
-                        let first_size = !shaped(&video.playback) && shaped(&playback);
-                        if let Some(seek) = self.seeking.filter(|s| !s.dragging) {
-                            if (playback.position - seek.target).abs() < SEEK_SETTLE_SECONDS
-                                || seek.since.elapsed() > SEEK_SETTLE_WAIT
-                            {
-                                self.seeking = None;
-                            }
-                        }
-                        video.playback = playback;
-                        // Now the shape is known, frames can be drawn at it
-                        // and mpv adds no bars of its own.
-                        if first_size {
-                            self.size_video();
-                        }
-                    }
-                    hyprforge_video::Update::Failed(e) => video.error = Some(e),
-                }
-                Task::none()
-            }
-            // Scrubbing: the picture follows the bar while it is dragged,
-            // by fast keyframe seeks — the player collapses a run of them
-            // into the last — and lands exactly where it is let go.
-            Message::SeekTo(seconds) => {
-                self.seeking = Some(Seeking { target: seconds, dragging: true, since: Instant::now() });
-                if let Some(player) = self.video.as_ref().and_then(|v| v.player.as_ref()) {
-                    player.send(hyprforge_video::Command::Seek { seconds, relative: false, exact: false });
-                }
-                Task::none()
-            }
-            Message::SeekRelease => {
-                if let Some(seek) = self.seeking {
-                    if let Some(player) = self.video.as_ref().and_then(|v| v.player.as_ref()) {
-                        player.send(hyprforge_video::Command::Seek { seconds: seek.target, relative: false, exact: true });
-                    }
-                    self.seeking = Some(Seeking { dragging: false, since: Instant::now(), ..seek });
+            Message::Video(message) => {
+                if let Some(video) = self.video.as_mut() {
+                    video.update(message);
                 }
                 Task::none()
             }
@@ -1079,14 +967,15 @@ impl App {
                 match result {
                     Ok(loaded) => {
                         let format = hyprforge_mesh::detect(&path).unwrap_or(hyprforge_mesh::Format::Stl);
-                        let mut camera = match (&self.model, reload) {
-                            (Some(old), true) if old.path == path => old.camera,
-                            _ => ModelCamera::default(),
-                        };
-                        camera.perspective = self.prefs.model_projection().value();
-                        let b = loaded.mesh.bounds;
-                        camera.fit(b.min, b.max, reload, true);
                         self.model_generation += 1;
+                        let pane = match self.model.take() {
+                            // The same file read again keeps the view.
+                            Some(mut old) if reload && old.path == path => {
+                                old.pane.reloaded(&loaded, self.model_generation);
+                                old.pane
+                            }
+                            _ => ModelPane::new(path.clone(), &loaded, self.model_generation, self.prefs.model_projection()),
+                        };
                         self.failed.remove(&path);
                         if loaded.bytes.is_some() {
                             self.current_bytes = loaded.bytes;
@@ -1094,9 +983,7 @@ impl App {
                         self.model = Some(ModelView {
                             facts: hyprforge_media::info::ModelFacts::of(format, &loaded.mesh),
                             path,
-                            mesh: loaded.mesh,
-                            generation: self.model_generation,
-                            camera,
+                            pane,
                             warning: loaded.warning,
                             modified: loaded.modified,
                         });
@@ -1113,40 +1000,19 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ModelPress(drag) => {
-                self.menu_open = false;
-                self.model_drag = self.cursor.map(|at| (drag, at));
-                Task::none()
-            }
-            Message::ModelRelease => {
-                self.model_drag = None;
-                Task::none()
-            }
-            Message::ModelPointer(point) => {
-                let viewport = self.viewport();
-                if let (Some((drag, last)), Some(model)) = (self.model_drag, self.model.as_mut()) {
-                    let (w, h) = (viewport.width, viewport.height);
-                    match drag {
-                        ModelDrag::Turn => model.camera.rotate([last.x, last.y], [point.x, point.y], w, h),
-                        ModelDrag::Pan => model.camera.pan([point.x - last.x, point.y - last.y], w, h),
+            Message::Model(message) => {
+                if matches!(message, ModelMessage::Press(_)) {
+                    self.menu_open = false;
+                }
+                if let ModelMessage::Pointer(point) = message {
+                    self.cursor = Some(point);
+                    if let Some(show) = &mut self.show {
+                        show.pointer_moved = Instant::now();
                     }
-                    self.model_drag = Some((drag, point));
                 }
-                self.cursor = Some(point);
-                if let Some(show) = &mut self.show {
-                    show.pointer_moved = Instant::now();
-                }
-                Task::none()
-            }
-            Message::ModelScrolled(delta) => {
                 let viewport = self.viewport();
-                let units = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => y * MODEL_UNITS_PER_LINE,
-                    mouse::ScrollDelta::Pixels { y, .. } => y,
-                };
                 if let Some(model) = self.model.as_mut() {
-                    let at = self.cursor.map_or([viewport.width / 2.0, viewport.height / 2.0], |p| [p.x, p.y]);
-                    model.camera.zoom_at(at, units, false, viewport.width, viewport.height);
+                    model.pane.update(message, Size::new(viewport.width, viewport.height));
                 }
                 Task::none()
             }
@@ -1351,7 +1217,6 @@ impl App {
         // Nothing plays behind the grid or the library.
         if mode != Mode::Photo {
             self.video = None;
-            self.seeking = None;
         }
         match mode {
             Mode::Photo => self.show_current(),
@@ -1460,13 +1325,12 @@ impl App {
             self.shown = None;
             self.model = None;
             let mut tasks = vec![self.request_details(), self.request_thumbs()];
-            if self.video.as_ref().is_none_or(|v| v.path != item.path) {
+            if self.video.as_ref().is_none_or(|v| v.path() != item.path) {
                 tasks.push(self.open_video(item.path.clone()));
             }
             return Task::batch(tasks);
         }
         self.video = None;
-        self.seeking = None;
 
         // A model is drawn by the model view, not decoded: hold its mesh,
         // and let go of any other — one model's geometry at a time.
@@ -1480,7 +1344,6 @@ impl App {
             return Task::batch(tasks);
         }
         self.model = None;
-        self.model_drag = None;
 
         let mut tasks = Vec::new();
         match self.cache.get(&item.path) {
@@ -1505,58 +1368,23 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// Starts playing `path` in the pane. A machine without libmpv gets a
-    /// sentence where the video would be, and everything else still works.
+    /// Starts playing `path` in the pane — see `hyprforge_viewer::video`.
+    /// A machine without libmpv gets a sentence where the video would be,
+    /// and everything else still works.
     fn open_video(&mut self, path: PathBuf) -> Task<Message> {
         self.video_generation += 1;
-        let generation = self.video_generation;
-        let root = hyprforge_ui::theme::surface::root();
-        let to_byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let options = hyprforge_video::Options {
-            background: [to_byte(root.r), to_byte(root.g), to_byte(root.b)],
-            size: self.video_pixels(),
-            // A slideshow plays each video through; a video opened by
-            // paging to it plays too — it is what paging to a video means.
-            paused: false,
-            muted: false,
-        };
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        match hyprforge_video::Player::open(&path, options, move |update| {
-            let _ = tx.send(update);
-        }) {
-            Ok(player) => {
-                self.video = Some(VideoView {
-                    path,
-                    generation,
-                    player: Some(player),
-                    frame: None,
-                    playback: hyprforge_video::Playback::default(),
-                    error: None,
-                });
-                // Until the player is dropped and its thread lets go of
-                // the sender, which ends the stream.
-                let stream = iced::futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
-                Task::run(stream, move |update| Message::Video(generation, update))
-            }
-            Err(e) => {
-                let said = match e {
-                    hyprforge_video::MpvError::Missing => {
-                        "Videos play through mpv, which isn't installed here. Shift+Enter opens this one in another player."
-                            .to_string()
-                    }
-                    other => other.to_string(),
-                };
-                self.video = Some(VideoView {
-                    path,
-                    generation,
-                    player: None,
-                    frame: None,
-                    playback: hyprforge_video::Playback::default(),
-                    error: Some(said),
-                });
-                Task::none()
-            }
-        }
+        // A slideshow plays each video through; a video opened by paging
+        // to it plays too — it is what paging to a video means.
+        let (pane, task) = VideoPane::open(
+            path,
+            self.video_generation,
+            self.video_pixels(),
+            false,
+            false,
+            "Shift+Enter opens this one in another player.",
+        );
+        self.video = Some(pane);
+        task.map(Message::Video)
     }
 
     /// The pane's size in physical pixels — what the player draws frames at.
@@ -1565,22 +1393,12 @@ impl App {
         ((v.width * self.scale_factor).round() as u32, (v.height * self.scale_factor).round() as u32)
     }
 
-    /// Tells the player the pane changed size: frames drawn at the video's
-    /// own shape fitted inside the pane, once the shape is known, so mpv
-    /// letterboxes nothing (its bars are black whatever it is told) and
-    /// the themed pane shows around the picture instead.
-    fn size_video(&self) {
-        let Some(video) = &self.video else { return };
-        let Some(player) = &video.player else { return };
-        let (pw, ph) = self.video_pixels();
-        let (w, h) = match video.playback.video_size.filter(|(w, h)| *w > 0 && *h > 0) {
-            Some((vw, vh)) => {
-                let k = (pw as f32 / vw as f32).min(ph as f32 / vh as f32);
-                ((vw as f32 * k).round() as u32, (vh as f32 * k).round() as u32)
-            }
-            None => (pw, ph),
-        };
-        player.send(hyprforge_video::Command::Size(w.max(16), h.max(1)));
+    /// Tells the player the pane changed size — see `VideoPane::resize`.
+    fn size_video(&mut self) {
+        let pixels = self.video_pixels();
+        if let Some(video) = self.video.as_mut() {
+            video.resize(pixels);
+        }
     }
 
     fn video_on_screen(&self) -> bool {
@@ -1589,14 +1407,8 @@ impl App {
 
     /// Space on a video: pause, play, or from the start again at the end.
     fn play_pause(&mut self) {
-        if let Some(video) = &self.video {
-            if let Some(player) = &video.player {
-                player.send(if video.playback.ended {
-                    hyprforge_video::Command::Restart
-                } else {
-                    hyprforge_video::Command::TogglePause
-                });
-            }
+        if let Some(video) = self.video.as_mut() {
+            video.update(VideoMessage::PlayPause);
         }
     }
 
@@ -1644,15 +1456,15 @@ impl App {
         let model = self.model.as_mut();
         let view = |model: Option<&mut ModelView>, v: ViewPoint| {
             if let Some(m) = model {
-                m.camera.set_viewpoint(v);
+                m.pane.camera_mut().set_viewpoint(v);
             }
         };
         match action {
             // `0`/`F`: iso and back in the middle — "fit" for a model.
             Action::ZoomFit => {
                 if let Some(m) = model {
-                    m.camera.set_viewpoint(ViewPoint::Iso);
-                    m.camera.set_viewpoint(ViewPoint::Center);
+                    m.pane.camera_mut().set_viewpoint(ViewPoint::Iso);
+                    m.pane.camera_mut().set_viewpoint(ViewPoint::Center);
                 }
             }
             // `1`: straight down — "actual size" has no meaning without
@@ -1666,9 +1478,10 @@ impl App {
             Action::ViewCenter => view(model, ViewPoint::Center),
             Action::ZoomIn | Action::ZoomOut => {
                 if let Some(m) = model {
-                    let units = if action == Action::ZoomIn { MODEL_UNITS_PER_LINE } else { -MODEL_UNITS_PER_LINE };
+                    let units = hyprforge_viewer::model_pane::UNITS_PER_LINE;
+                    let units = if action == Action::ZoomIn { units } else { -units };
                     let centre = [viewport.width / 2.0, viewport.height / 2.0];
-                    m.camera.zoom_at(centre, units, false, viewport.width, viewport.height);
+                    m.pane.camera_mut().zoom_at(centre, units, false, viewport.width, viewport.height);
                 }
             }
             Action::CycleDrawMode => {
@@ -1680,7 +1493,7 @@ impl App {
                 self.prefs.model_projection = next.id().to_string();
                 save_pref(|p| p.model_projection = next.id().to_string());
                 if let Some(m) = self.model.as_mut() {
-                    m.camera.perspective = next.value();
+                    m.pane.camera_mut().perspective = next.value();
                 }
             }
             Action::ToggleAxes => {
@@ -1908,16 +1721,14 @@ impl App {
             }
         }
         if self.video_on_screen() {
-            let player = self.video.as_ref().and_then(|v| v.player.as_ref());
             match action {
                 Action::PlayPause | Action::Activate => {
                     self.play_pause();
                     return Task::none();
                 }
                 Action::SeekForward | Action::SeekBack => {
-                    if let Some(player) = player {
-                        let seconds = if action == Action::SeekForward { 5.0 } else { -5.0 };
-                        player.send(hyprforge_video::Command::Seek { seconds, relative: true, exact: true });
+                    if let Some(video) = &self.video {
+                        video.seek_by(if action == Action::SeekForward { 5.0 } else { -5.0 });
                     }
                     return Task::none();
                 }
@@ -1925,8 +1736,8 @@ impl App {
                     // mpv's own toggle, not "the opposite of what it last
                     // said": a press before its report of the one before
                     // used to send the same state twice, and do nothing.
-                    if let Some(player) = player {
-                        player.send(hyprforge_video::Command::ToggleMute);
+                    if let Some(video) = self.video.as_mut() {
+                        video.update(VideoMessage::ToggleMute);
                     }
                     return Task::none();
                 }
@@ -2180,7 +1991,7 @@ impl App {
         }
         // A video plays through before the show moves on; one that could
         // not play is passed like a picture.
-        if self.video.as_ref().is_some_and(|v| v.player.is_some() && v.error.is_none() && !v.playback.ended) {
+        if self.video.as_ref().is_some_and(|v| v.playing() && v.error().is_none() && !v.playback().ended) {
             return Task::none();
         }
         // The next picture only once this one is actually on screen: a

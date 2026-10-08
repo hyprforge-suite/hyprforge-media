@@ -32,8 +32,8 @@
 //!
 //! The window itself — the `iced` application that renders all of this —
 //! is `src/main.rs` (state and the slow work) and `src/view.rs` (the
-//! widgets), with `src/film.rs` drawing a playing video's frames and
-//! `src/model/` a 3D model on the GPU, and is deliberately thin: it turns these decisions into
+//! widgets), with a playing video and a 3D model drawn by
+//! `hyprforge-viewer`'s panes, and is deliberately thin: it turns these decisions into
 //! widgets and runs the slow work (decoding, reading EXIF, listing
 //! folders, trashing, the clipboard, the wallpaper) off the thread that
 //! paints.
