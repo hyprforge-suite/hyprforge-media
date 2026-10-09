@@ -2,6 +2,8 @@
 
 A photo, video and 3D model viewer for Hyprland.
 
+![Media's grid: a folder of photos grouped under the day each was taken](https://raw.githubusercontent.com/hyprforge-suite/hyprforge/main/docs/images/media.png)
+
 Open one picture and it floats, sized to the picture, on the monitor the
 pointer is on. Open a folder and it is a viewer over that folder, in the
 **same order the file manager shows it** — "next" is asked of
