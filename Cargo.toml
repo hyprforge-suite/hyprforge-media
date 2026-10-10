@@ -1,6 +1,6 @@
 [package]
 name = "hyprforge-media"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "MIT"
 description = "A photo, video and 3D model viewer for Hyprland: a folder browsed in the file manager's order, a date-grouped grid and library, EXIF and orientation done right, videos through libmpv, STL/3MF/OBJ models on the GPU, and a slideshow."
