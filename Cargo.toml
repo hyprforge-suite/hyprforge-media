@@ -73,7 +73,7 @@ hyprforge-core = { version = "0.1", default-features = false }
 #
 # Spelled out rather than inherited, like every dependency in this
 # file: this manifest is the root of its own repository once split, and
-# `check.sh`'s "Standalone crate dependency pins" step holds the copy to
+# `tools/hf check`'s "Standalone crate dependency pins" step holds the copy to
 # the workspace table.
 iced = { version = "0.14", default-features = false, features = [
     "wgpu",

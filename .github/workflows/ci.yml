@@ -16,7 +16,7 @@
 #     run time, not linked, and ffmpeg is a subprocess, so the build does
 #     not need them — and a test that needs one has to say so with the
 #     `HYPRFORGE-SKIP:` marker rather than fail, the same rule the suite's
-#     `check.sh` applies.
+#     `tools/hf` applies.
 #
 # A green run means the code is internally consistent. It does not mean
 # a picture has ever been drawn.
