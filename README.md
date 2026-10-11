@@ -15,7 +15,9 @@ what was looked at.
 
 Pictures are decoded **within a budget** and orientation-correct, through
 `hyprforge-image`; a 36-megapixel file is measured before it is decoded,
-not after. Videos play through libmpv, opened at run time rather than
+not after. An animated GIF plays, every frame together inside what one
+still may keep; zoomed in past the window it stands still on its first
+frame, and plays again on the way out. Videos play through libmpv, opened at run time rather than
 linked, so a machine without mpv still runs the viewer and a video says
 what is missing. STL, 3MF and OBJ models are loaded into a welded mesh
 by `hyprforge-mesh` and drawn on the GPU with fstl's camera, inside the

@@ -298,6 +298,25 @@ impl App {
         col.into()
     }
 
+    /// The picture on screen at `w` x `h`: the still, and over it the
+    /// animation's film while one is playing. The still stays underneath
+    /// because a film draws nothing on iced's software renderer — there
+    /// the picture simply does not move.
+    fn picture(&self, shown: &super::Shown, w: f32, h: f32) -> Element<'_, Message> {
+        let still = image(shown.handle.clone())
+            .width(Length::Fixed(w))
+            .height(Length::Fixed(h))
+            .content_fit(iced::ContentFit::Fill);
+        match self.playing() {
+            Some(playing) => stack![
+                still,
+                iced::widget::shader(playing.film.program()).width(Length::Fixed(w)).height(Length::Fixed(h)),
+            ]
+            .into(),
+            None => still.into(),
+        }
+    }
+
     /// The picture itself, placed by the transform and clipped to the
     /// viewport; or a sentence where there is no picture to place.
     fn canvas(&self) -> Element<'_, Message> {
@@ -321,10 +340,7 @@ impl App {
             } else if let Some(shown) = &self.shown {
                 let (w, h) = self.transform.drawn_size(shown.size, viewport);
                 let at = self.transform.top_left(shown.size, viewport);
-                pin(image(shown.handle.clone())
-                    .width(Length::Fixed(w))
-                    .height(Length::Fixed(h))
-                    .content_fit(iced::ContentFit::Fill))
+                pin(self.picture(shown, w, h))
                 .x(at.x)
                 .y(at.y)
                 .width(Length::Fill)
@@ -1008,12 +1024,7 @@ impl App {
                 let viewport = self.viewport();
                 let fit = hyprforge_media::transform::Transform::default();
                 let (w, h) = fit.drawn_size(shown.size, viewport);
-                container(
-                    image(shown.handle.clone())
-                        .width(Length::Fixed(w))
-                        .height(Length::Fixed(h))
-                        .content_fit(iced::ContentFit::Fill),
-                )
+                container(self.picture(shown, w, h))
                 .center(Length::Fill)
                 .into()
             }

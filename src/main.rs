@@ -39,7 +39,7 @@
 
 mod view;
 
-use hyprforge_image::{decode_to_fit, Budget, Camera, Decoded, Measured, ViewportPixels};
+use hyprforge_image::{decode_animation, decode_to_fit, Budget, Camera, Decoded, Measured, ViewportPixels};
 use hyprforge_listing::backend::{FsBackend, StdBackend};
 use hyprforge_media::args::{self, Args};
 use hyprforge_media::cache::Cache;
@@ -197,6 +197,7 @@ fn main() -> iced::Result {
         last_selected: HashMap::new(),
         cache: Cache::default(),
         decoding: HashSet::new(),
+        animating: None,
         failed: HashMap::new(),
         shown: None,
         turns: Turns::none(),
@@ -320,6 +321,35 @@ struct Shown {
     /// means one pixel of the photograph per logical pixel, however small
     /// the buffer it was decoded into.
     size: ImageSize,
+    /// The picture's frames, when it is an animated GIF and they have
+    /// been decoded — the still above is shown until then, and stays
+    /// behind the film for iced's software renderer, where a film draws
+    /// nothing.
+    animation: Option<Playing>,
+}
+
+/// An animation on screen: its frames as decoded, kept so a turn can
+/// rotate them again without decoding the file a second time, and as
+/// played.
+struct Playing {
+    decoded: Arc<hyprforge_image::Animation>,
+    film: hyprforge_viewer::animation::Animation,
+}
+
+impl Playing {
+    fn new(decoded: Arc<hyprforge_image::Animation>, turns: Turns) -> Option<Playing> {
+        let (w, h) = (decoded.size.width, decoded.size.height);
+        let frames = decoded
+            .frames
+            .iter()
+            .map(|frame| {
+                let (pixels, width, height) = rotate_rgba(&frame.pixels, w, h, turns);
+                (hyprforge_video::Frame { width, height, pixels }, frame.delay)
+            })
+            .collect();
+        let film = hyprforge_viewer::animation::Animation::new(frames)?;
+        Some(Playing { decoded, film })
+    }
 }
 
 /// What the header of a file says, for the inspector and the status bar
@@ -403,6 +433,8 @@ struct App {
     cache: Cache,
     /// Decodes in flight, so a picture is never decoded twice at once.
     decoding: HashSet<PathBuf>,
+    /// The animation being decoded, if any, so it is not asked for twice.
+    animating: Option<PathBuf>,
     /// Pictures that could not be decoded, with the sentence to show.
     failed: HashMap<PathBuf, String>,
     shown: Option<Shown>,
@@ -479,6 +511,11 @@ enum Message {
     FolderRead(PathBuf, Result<Vec<hyprforge_listing::types::Entry>, String>),
     Summaries(PathBuf, Result<Vec<Summary>, String>),
     Decoded(PathBuf, Result<Arc<Decoded>, String>),
+    /// An animated GIF's frames, or `None` for a picture that turned out
+    /// not to be one.
+    Animated(PathBuf, Result<Option<Arc<hyprforge_image::Animation>>, String>),
+    /// The animation on screen has shown its frame for as long as it asks.
+    NextFrame,
     Details(PathBuf, Option<Measured>, Camera),
     Thumb(PathBuf, Option<image::Handle>),
     Key(hyprforge_keys::KeyPress),
@@ -553,11 +590,19 @@ impl App {
             (Some(_), true) => iced::time::every(MODEL_CHECK_EVERY).map(|_| Message::CheckModelFile),
             _ => Subscription::none(),
         };
+        // Each frame for its own delay. The subscription is keyed on the
+        // duration, so a run of equal delays is one steady timer and a
+        // change of delay starts the next one from now.
+        let frames = match self.playing() {
+            Some(playing) => iced::time::every(playing.film.delay()).map(|_| Message::NextFrame),
+            None => Subscription::none(),
+        };
         Subscription::batch([
             keyboard::listen().filter_map(|event| hyprforge_ui::keys::key_press(&event).map(Message::Key)),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
             tick,
             watch,
+            frames,
         ])
     }
 
@@ -808,11 +853,38 @@ impl App {
                         self.cache.put(&path, decoded.clone());
                         if self.current_path().as_deref() == Some(path.as_path()) {
                             self.present(path, decoded);
+                            return self.animate();
                         }
                     }
                     Err(e) => {
                         self.failed.insert(path, e);
                     }
+                }
+                Task::none()
+            }
+            Message::Animated(path, result) => {
+                if self.animating.as_deref() == Some(path.as_path()) {
+                    self.animating = None;
+                }
+                match result {
+                    Ok(Some(decoded)) => {
+                        let turns = self.turns;
+                        if let Some(shown) = self.shown.as_mut().filter(|s| s.path == path) {
+                            shown.animation = Playing::new(decoded, turns);
+                        }
+                    }
+                    Ok(None) => {}
+                    // The still decoded and is on screen, so this is the
+                    // difference between a picture that moves and one that
+                    // does not — worth a line in the log, not a sentence
+                    // over a picture that is showing perfectly well.
+                    Err(e) => tracing::warn!(path = %path.display(), error = %e, "couldn't decode the animation"),
+                }
+                Task::none()
+            }
+            Message::NextFrame => {
+                if let Some(playing) = self.shown.as_mut().and_then(|s| s.animation.as_mut()) {
+                    playing.film.advance();
                 }
                 Task::none()
             }
@@ -1347,7 +1419,10 @@ impl App {
 
         let mut tasks = Vec::new();
         match self.cache.get(&item.path) {
-            Some(decoded) => self.present(item.path.clone(), decoded),
+            Some(decoded) => {
+                self.present(item.path.clone(), decoded);
+                tasks.push(self.animate());
+            }
             None => {
                 // The previous picture stays up until this one is ready,
                 // unless it is a clip, which has nothing to show.
@@ -1582,12 +1657,72 @@ impl App {
             rotate_rgba(&decoded.pixels, decoded.size.width, decoded.size.height, self.turns);
         let (source_w, source_h) =
             hyprforge_media::rotation::presented_size(decoded.measured.display_size(), self.turns);
+        // The same file again — a turn, or a sharper re-decode — keeps
+        // its frames, turned to match, rather than decoding them again.
+        let animation = self
+            .shown
+            .take()
+            .filter(|s| s.path == path)
+            .and_then(|s| s.animation)
+            .and_then(|playing| Playing::new(playing.decoded, self.turns));
         self.shown = Some(Shown {
             path,
             handle: image::Handle::from_rgba(width, height, pixels),
             decoded,
             size: ImageSize { width: source_w as f32, height: source_h as f32 },
+            animation,
         });
+    }
+
+    /// Decodes the frames of the picture on screen, when it is a GIF and
+    /// they are not already here. After the still, never instead of it:
+    /// the first frame is up at once, and a long animation's frames take
+    /// a while.
+    fn animate(&mut self) -> Task<Message> {
+        let Some(shown) = &self.shown else { return Task::none() };
+        if shown.animation.is_some()
+            || shown.decoded.measured.format != ::image::ImageFormat::Gif
+            || self.animating.as_deref() == Some(shown.path.as_path())
+        {
+            return Task::none();
+        }
+        let path = shown.path.clone();
+        self.animating = Some(path.clone());
+        let budget = self.budget();
+        Task::perform(
+            async move {
+                let for_task = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    decode_animation(&for_task, &budget).map(|a| a.map(Arc::new)).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("The decoder stopped unexpectedly: {e}")));
+                (path, result)
+            },
+            |(path, result)| Message::Animated(path, result),
+        )
+    }
+
+    /// The animation to play now, if any: one on screen, in Photo mode
+    /// or a slideshow, and drawn whole. Zoomed in past the window it
+    /// stands still on its first frame — the film draws a frame into a
+    /// rectangle inside the window, and a picture larger than the window
+    /// is not one — and it plays again on the way back out.
+    fn playing(&self) -> Option<&Playing> {
+        let shown = self.shown.as_ref()?;
+        let playing = shown.animation.as_ref()?;
+        if self.current_path().as_deref() != Some(shown.path.as_path()) {
+            return None;
+        }
+        if self.show.is_some() {
+            return Some(playing);
+        }
+        if self.mode != Mode::Photo {
+            return None;
+        }
+        let viewport = self.viewport();
+        let (w, h) = self.transform.drawn_size(shown.size, viewport);
+        (w <= viewport.width + 0.5 && h <= viewport.height + 0.5).then_some(playing)
     }
 
     fn redecode_current(&mut self) -> Task<Message> {
@@ -1760,8 +1895,12 @@ impl App {
             Action::RotateLeft | Action::RotateRight => {
                 self.turns = if action == Action::RotateRight { self.turns.right() } else { self.turns.left() };
                 self.transform.fit();
-                if let Some(shown) = self.shown.take() {
-                    self.present(shown.path, shown.decoded);
+                // Not `take`n: `present` keeps the animation's frames from
+                // the picture it replaces when it is the same file, and
+                // turns them too.
+                if let Some(shown) = &self.shown {
+                    let (path, decoded) = (shown.path.clone(), shown.decoded.clone());
+                    self.present(path, decoded);
                 }
             }
             Action::ToggleFullscreen => {
