@@ -85,6 +85,8 @@ pub enum Action {
     ToggleProjection,
     /// The model's X/Y/Z axes and the little axis flower in the corner.
     ToggleAxes,
+    /// Whether a model on screen is read again when its file changes.
+    ToggleAutoreload,
     /// Read the model from disk again, keeping the view.
     Reload,
     /// Play or pause a video — and on anything else, the next picture,
@@ -148,6 +150,7 @@ impl Action {
             Action::CycleDrawMode,
             Action::ToggleProjection,
             Action::ToggleAxes,
+            Action::ToggleAutoreload,
             Action::Reload,
             Action::PlayPause,
             Action::SeekForward,
@@ -199,6 +202,7 @@ impl Action {
             Action::CycleDrawMode => "draw-mode",
             Action::ToggleProjection => "projection",
             Action::ToggleAxes => "axes",
+            Action::ToggleAutoreload => "autoreload",
             Action::Reload => "reload",
             Action::PlayPause => "play-pause",
             Action::SeekForward => "seek-forward",
@@ -249,6 +253,7 @@ impl Action {
             Action::CycleDrawMode => "Next Draw Mode",
             Action::ToggleProjection => "Perspective / Orthographic",
             Action::ToggleAxes => "Axes",
+            Action::ToggleAutoreload => "Reload When the File Changes",
             Action::Reload => "Reload",
             Action::PlayPause => "Play / Pause",
             Action::SeekForward => "Forward 5 Seconds",
@@ -321,6 +326,8 @@ impl Action {
             Action::CycleDrawMode => &["M"],
             Action::ToggleProjection => &["O"],
             Action::ToggleAxes => &["X"],
+            // Beside Reload's Ctrl+R: the same subject, kept on.
+            Action::ToggleAutoreload => &["Ctrl+Shift+R"],
             // view3d reloaded on F5, which is the slideshow here.
             Action::Reload => &["Ctrl+R"],
             Action::PlayPause => &["Space"],

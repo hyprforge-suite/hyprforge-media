@@ -524,6 +524,9 @@ impl App {
                 container(Space::new()).width(Length::Fixed(1.0)).height(Length::Fixed(16.0)).style(|_t: &Theme| plane(surface::card_border())),
                 segment(if ortho { "Ortho" } else { "Persp" }, Message::Perform(Action::ToggleProjection), false),
                 segment("Axes", Message::Perform(Action::ToggleAxes), self.prefs.model_axes),
+                // Lit while the model follows its file — a live preview
+                // beside a CAD tool or a slicer.
+                segment("Live", Message::Perform(Action::ToggleAutoreload), self.prefs.model_autoreload),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),

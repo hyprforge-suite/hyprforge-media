@@ -1654,6 +1654,13 @@ impl App {
                 let on = self.prefs.model_axes;
                 save_pref(|p| p.model_axes = on);
             }
+            // The watch is a subscription on this pref, so it starts and
+            // stops with it; nothing else to do here.
+            Action::ToggleAutoreload => {
+                self.prefs.model_autoreload = !self.prefs.model_autoreload;
+                let on = self.prefs.model_autoreload;
+                save_pref(|p| p.model_autoreload = on);
+            }
             Action::Reload => {
                 let path = self.current_path()?;
                 self.failed.remove(&path);
@@ -2130,6 +2137,7 @@ impl App {
             | Action::CycleDrawMode
             | Action::ToggleProjection
             | Action::ToggleAxes
+            | Action::ToggleAutoreload
             | Action::Reload => {}
             Action::OpenExternally => return self.open_externally(),
             Action::ShowInFiles => {
