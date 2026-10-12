@@ -104,6 +104,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Draws the window's views headless, through iced's own renderer, so the
+# picture tests in `main.rs` read pixels the way a screen would show them.
+iced_test = "0.14"
 # `MockBackend`, so the folder model — what the next picture is, what
 # happens at the ends, what a folder of mixed stills and clips does — is
 # exercised without a disk.

@@ -337,7 +337,7 @@ impl App {
 
     /// The picture itself, placed by the transform and clipped to the
     /// viewport; or a sentence where there is no picture to place.
-    fn canvas(&self) -> Element<'_, Message> {
+    pub(super) fn canvas(&self) -> Element<'_, Message> {
         let scale = self.font_scale;
         let viewport = self.viewport();
         let centred = |said: String| -> Element<'_, Message> {

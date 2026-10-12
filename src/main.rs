@@ -194,56 +194,12 @@ fn main() -> iced::Result {
         order: ordering.order,
         prefs,
         mode,
-        folder: Folder::default(),
-        folder_path: None,
-        focus: None,
-        loading_folder: false,
-        folder_error: None,
-        history: History::default(),
-        last_selected: HashMap::new(),
-        cache: Cache::default(),
-        decoding: HashSet::new(),
-        animating: None,
-        failed: HashMap::new(),
-        shown: None,
-        turns: Turns::none(),
-        transform: Transform::default(),
-        details: None,
-        details_wanted: None,
-        window: None,
-        window_size: size,
-        scale_factor: 1.0,
-        fullscreen: false,
-        dragging: None,
-        cursor: None,
-        scroll_pixels: 0.0,
-        resize_generation: 0,
-        detail_generation: 0,
-        thumbs: HashMap::new(),
-        thumbs_wanted: HashSet::new(),
-        current_bytes: None,
         places,
-        folders: HashMap::new(),
-        library_dir: None,
-        library_cursor: 0,
-        grid_scroll: (0.0, size.height),
-        library_scroll: (0.0, size.height),
-        menu_open: false,
-        show: None,
-        model: None,
-        model_loading: None,
-        model_generation: 0,
         compact,
         float_picture,
-        floated: false,
         planned_float,
-        video: None,
-        video_generation: 0,
-        thumb_cache: hyprforge_thumbnails::Cache::standard().map(Arc::new),
         notice: problems.first().cloned(),
-        undo: None,
-        clipboard: Arc::new(hyprforge_clipboard::WaylandWriter::new()),
-        font_scale: FontScale(hyprforge_ui::theme::active().font_scale),
+        ..App::blank(size)
     };
 
     let mut boot_tasks = vec![window::latest().map(Message::WindowFound)];
@@ -274,6 +230,71 @@ fn main() -> iced::Result {
         ..window::Settings::default()
     })
     .run()
+}
+
+impl App {
+    /// A window with nothing open: every field at its starting value,
+    /// with the defaults for what `main` reads from disk. `main` starts
+    /// from this and sets what it read; the tests start from it as is,
+    /// so a field added here is one place, not two.
+    fn blank(size: Size) -> App {
+        App {
+            keymap: hyprforge_media::keys::defaults(),
+            order: hyprforge_listing::order::Order::default(),
+            prefs: prefs::Prefs::default(),
+            mode: Mode::Photo,
+            folder: Folder::default(),
+            folder_path: None,
+            focus: None,
+            loading_folder: false,
+            folder_error: None,
+            history: History::default(),
+            last_selected: HashMap::new(),
+            cache: Cache::default(),
+            decoding: HashSet::new(),
+            animating: None,
+            failed: HashMap::new(),
+            shown: None,
+            turns: Turns::none(),
+            transform: Transform::default(),
+            details: None,
+            details_wanted: None,
+            window: None,
+            window_size: size,
+            scale_factor: 1.0,
+            fullscreen: false,
+            dragging: None,
+            cursor: None,
+            scroll_pixels: 0.0,
+            resize_generation: 0,
+            detail_generation: 0,
+            thumbs: HashMap::new(),
+            thumbs_wanted: HashSet::new(),
+            current_bytes: None,
+            places: Vec::new(),
+            folders: HashMap::new(),
+            library_dir: None,
+            library_cursor: 0,
+            grid_scroll: (0.0, size.height),
+            library_scroll: (0.0, size.height),
+            menu_open: false,
+            show: None,
+            model: None,
+            model_loading: None,
+            model_generation: 0,
+            compact: None,
+            float_picture: None,
+            floated: false,
+            planned_float: None,
+            video: None,
+            video_generation: 0,
+            thumb_cache: hyprforge_thumbnails::Cache::standard().map(Arc::new),
+            notice: None,
+            undo: None,
+            clipboard: Arc::new(hyprforge_clipboard::WaylandWriter::new()),
+            font_scale: FontScale(hyprforge_ui::theme::active().font_scale),
+        }
+    }
 }
 
 /// The three modes of the window — mockup `2a`'s segmented switch.
@@ -2482,5 +2503,146 @@ fn set_wallpaper(picture: &Path) -> Result<String, String> {
         )),
         Ok(other) => Ok(format!("Saved as your wallpaper ({other:?}).")),
         Err(e) => Err(format!("Couldn't apply the wallpaper: {e}")),
+    }
+}
+
+/// The picture as the window draws it, read back as pixels.
+///
+/// Through iced's own headless harness (`iced_test`) on `iced_tiny_skia`,
+/// the renderer every machine has — so these run in CI, where there is
+/// no GPU for the wgpu path the window normally takes. What they pin is
+/// everything between a file and the pixels the canvas lays down: the
+/// decode, the file's orientation, the user's turns, the handle's channel
+/// order, and the colour of what is drawn — the centre-pixel check
+/// CLAUDE.md describes, done by a test rather than once by hand.
+///
+/// Assertions on pixels rather than a byte-exact image: the canvas's
+/// overlay controls carry text, and a reference PNG would fail on every
+/// font or anti-aliasing change while saying nothing about the picture.
+#[cfg(test)]
+mod picture_tests {
+    use super::*;
+
+    /// Four quadrants in colours no channel swap or extra sRGB encode
+    /// leaves alone — not 255s and 0s, which survive both.
+    const TOP_LEFT: [u8; 3] = [200, 60, 30];
+    const TOP_RIGHT: [u8; 3] = [40, 160, 90];
+    const BOTTOM_LEFT: [u8; 3] = [50, 70, 190];
+    const BOTTOM_RIGHT: [u8; 3] = [230, 210, 40];
+
+    fn quadrants(dir: &Path, w: u32, h: u32) -> PathBuf {
+        let path = dir.join("quadrants.png");
+        ::image::RgbaImage::from_fn(w, h, |x, y| {
+            let [r, g, b] = match (x < w / 2, y < h / 2) {
+                (true, true) => TOP_LEFT,
+                (false, true) => TOP_RIGHT,
+                (true, false) => BOTTOM_LEFT,
+                (false, false) => BOTTOM_RIGHT,
+            };
+            ::image::Rgba([r, g, b, 255])
+        })
+        .save(&path)
+        .unwrap();
+        path
+    }
+
+    /// The window with `picture` open in Photo mode, turned by `turns`,
+    /// decoded the way the window decodes it.
+    fn showing(picture: &Path, turns: Turns) -> App {
+        let mut app = App::blank(Size::new(900.0, 700.0));
+        app.folder = Folder::build(StdBackend.read_dir(picture.parent().unwrap()).unwrap(), &app.order);
+        assert!(app.folder.focus_on(picture));
+        app.turns = turns;
+        let decoded = decode_to_fit(picture, &app.budget()).unwrap();
+        app.present(picture.to_path_buf(), Arc::new(decoded));
+        app
+    }
+
+    /// The canvas, drawn, and the scale its pixels are at.
+    fn drawn(app: &App) -> (::image::RgbaImage, f32) {
+        // SAFETY: every test here sets the same value, before any
+        // renderer is made, and nothing else reads it.
+        unsafe { std::env::set_var("ICED_TEST_BACKEND", "tiny-skia") };
+        let viewport = app.viewport();
+        let mut simulator =
+            iced_test::Simulator::with_size(iced::Settings::default(), Size::new(viewport.width, viewport.height), app.canvas());
+        let snapshot = simulator.snapshot(&app.theme()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(snapshot.matches_image(dir.path().join("canvas.png")).unwrap());
+        // The harness names the file after its renderer, which is how
+        // this checks the rig is the one it thinks it is.
+        let path = dir.path().join("canvas-tiny-skia.png");
+        assert!(path.exists(), "drawn by something other than tiny-skia");
+        let image = ::image::open(&path).unwrap().to_rgba8();
+        (image.clone(), image.width() as f32 / viewport.width)
+    }
+
+    fn rgb_at(image: &::image::RgbaImage, x: f32, y: f32) -> [u8; 3] {
+        let p = image.get_pixel(x.round() as u32, y.round() as u32).0;
+        [p[0], p[1], p[2]]
+    }
+
+    fn close(a: [u8; 3], b: [u8; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 1)
+    }
+
+    /// Where a quadrant's middle is on the canvas, in its pixels.
+    fn middle_of(app: &App, scale: f32, right: bool, bottom: bool) -> (f32, f32) {
+        let shown = app.shown.as_ref().unwrap();
+        let viewport = app.viewport();
+        let at = app.transform.top_left(shown.size, viewport);
+        let (w, h) = app.transform.drawn_size(shown.size, viewport);
+        let x = at.x + w * if right { 0.75 } else { 0.25 };
+        let y = at.y + h * if bottom { 0.75 } else { 0.25 };
+        (x * scale, y * scale)
+    }
+
+    fn assert_quadrants(app: &App, image: &::image::RgbaImage, scale: f32, expected: [[u8; 3]; 4]) {
+        let spots = [(false, false), (true, false), (false, true), (true, true)];
+        for ((right, bottom), want) in spots.into_iter().zip(expected) {
+            let (x, y) = middle_of(app, scale, right, bottom);
+            let got = rgb_at(image, x, y);
+            assert!(close(got, want), "at ({x}, {y}) right={right} bottom={bottom}: {got:?}, want {want:?}");
+        }
+    }
+
+    /// Upright, each quadrant lands where it is in the file and in the
+    /// file's own colour — the channel order and the colour handling of
+    /// the whole path, in one assertion each.
+    #[test]
+    fn a_picture_is_drawn_the_right_way_up_in_its_own_colours() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = showing(&quadrants(dir.path(), 200, 100), Turns::none());
+        let (image, scale) = drawn(&app);
+        assert_quadrants(&app, &image, scale, [TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT]);
+    }
+
+    /// A turn to the right moves the top-left quadrant to the top right,
+    /// as it does on screen — not merely a picture of the turned shape.
+    #[test]
+    fn a_turned_picture_is_drawn_turned() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = showing(&quadrants(dir.path(), 200, 100), Turns::none().right());
+        let (image, scale) = drawn(&app);
+        assert_quadrants(&app, &image, scale, [BOTTOM_LEFT, TOP_LEFT, BOTTOM_RIGHT, TOP_RIGHT]);
+    }
+
+    /// Around the picture is the theme's root surface, in exactly its
+    /// colour: the regression CLAUDE.md records, where one renderer drew
+    /// the same theme value visibly lighter than another.
+    #[test]
+    fn around_the_picture_is_the_themes_own_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = showing(&quadrants(dir.path(), 200, 100), Turns::none());
+        let (image, scale) = drawn(&app);
+        let viewport = app.viewport();
+        let root = hyprforge_ui::theme::surface::root();
+        let want = [root.r, root.g, root.b].map(|c| (c * 255.0).round() as u8);
+        // Halfway between the picture's top and the canvas's, in the
+        // middle: away from the overlay controls at the edges.
+        let shown = app.shown.as_ref().unwrap();
+        let top = app.transform.top_left(shown.size, viewport).y;
+        let got = rgb_at(&image, viewport.width / 2.0 * scale, top / 2.0 * scale);
+        assert!(close(got, want), "{got:?}, want the theme's {want:?}");
     }
 }
