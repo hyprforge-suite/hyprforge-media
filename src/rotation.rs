@@ -10,7 +10,7 @@
 //! of somebody's original, which is a different decision with a different
 //! standard of care (and an undo).
 
-use hyprforge_image::Orientation;
+use hyprforge_image::{Orientation, Region};
 
 /// Quarter turns clockwise, as the user has asked for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -92,6 +92,27 @@ pub fn rotate_rgba(pixels: &[u8], width: u32, height: u32, turns: Turns) -> (Vec
         }
     }
     (out, out_w as u32, out_h as u32)
+}
+
+/// Where a rectangle of a `width` by `height` picture lands once the
+/// picture is turned clockwise by `turns` — the same turn as
+/// [`rotate_rgba`], for a rectangle rather than its pixels. A sharper
+/// piece of the picture is decoded the way the file presents it and
+/// shown turned, so its place on screen has to be turned with it.
+pub fn turn_region(r: Region, width: u32, height: u32, turns: Turns) -> Region {
+    let swap = |x, y| Region { x, y, width: r.height, height: r.width };
+    match turns.quarters() {
+        0 => r,
+        1 => swap(height - r.y - r.height, r.x),
+        2 => Region { x: width - r.x - r.width, y: height - r.y - r.height, ..r },
+        _ => swap(r.y, width - r.x - r.width),
+    }
+}
+
+/// [`turn_region`] undone: a rectangle of the turned picture, which is
+/// `width` by `height` *as turned*, in the picture as the file presents it.
+pub fn unturn_region(r: Region, width: u32, height: u32, turns: Turns) -> Region {
+    turn_region(r, width, height, Turns((4 - turns.quarters()) % 4))
 }
 
 /// Whether the picture on screen is the right way up compared to how its
@@ -186,5 +207,38 @@ mod tests {
             current = rotate_rgba(&current.0, current.1, current.2, Turns::none().right());
         }
         assert_eq!(current, (pixels, 3, 2));
+    }
+
+    /// The rectangle goes where the pixels go: every turn, checked
+    /// against turning the pixels and reading the rectangle back out, on
+    /// a picture that is not square so a swapped edge cannot pass.
+    #[test]
+    fn a_turned_region_covers_the_same_pixels_the_turned_picture_has_there() {
+        let (w, h) = (5u32, 3u32);
+        let pixels: Vec<u8> = (0..w * h).flat_map(|i| [i as u8, 0, 0, 255]).collect();
+        let at = |p: &[u8], pw: u32, x: u32, y: u32| p[((y * pw + x) * 4) as usize];
+        let region = Region { x: 1, y: 0, width: 3, height: 2 };
+        let mut turns = Turns::none();
+        for _ in 0..4 {
+            let (turned, tw, th) = rotate_rgba(&pixels, w, h, turns);
+            let t = turn_region(region, w, h, turns);
+            let mut before: Vec<u8> = Vec::new();
+            for y in region.y..region.y + region.height {
+                for x in region.x..region.x + region.width {
+                    before.push(at(&pixels, w, x, y));
+                }
+            }
+            let mut after: Vec<u8> = Vec::new();
+            for y in t.y..t.y + t.height {
+                for x in t.x..t.x + t.width {
+                    after.push(at(&turned, tw, x, y));
+                }
+            }
+            before.sort_unstable();
+            after.sort_unstable();
+            assert_eq!(before, after, "{turns:?}");
+            assert_eq!(unturn_region(t, tw, th, turns), region, "{turns:?} undone");
+            turns = turns.right();
+        }
     }
 }

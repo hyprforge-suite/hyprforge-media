@@ -50,6 +50,7 @@
 pub mod args;
 pub mod cache;
 pub mod config;
+pub mod detail;
 pub mod filmstrip;
 pub mod float;
 pub mod folder;

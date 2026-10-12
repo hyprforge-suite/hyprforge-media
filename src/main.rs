@@ -39,7 +39,7 @@
 
 mod view;
 
-use hyprforge_image::{decode_animation, decode_to_fit, Budget, Camera, Decoded, Measured, ViewportPixels};
+use hyprforge_image::{decode_animation, decode_region, decode_to_fit, Budget, Camera, Decoded, Detail, Measured, Region, ViewportPixels};
 use hyprforge_listing::backend::{FsBackend, StdBackend};
 use hyprforge_media::args::{self, Args};
 use hyprforge_media::cache::Cache;
@@ -47,7 +47,7 @@ use hyprforge_media::folder::{Folder, Media};
 use hyprforge_media::history::History;
 use hyprforge_media::keys::{Action, Resolved};
 use hyprforge_media::library::Summary;
-use hyprforge_media::rotation::{rotate_rgba, Turns};
+use hyprforge_media::rotation::{rotate_rgba, turn_region, unturn_region, Turns};
 use hyprforge_mesh::camera::ViewPoint;
 use hyprforge_viewer::model_pane::{Loaded as LoadedModel, ModelMessage, ModelPane};
 use hyprforge_viewer::video::{VideoMessage, VideoPane};
@@ -101,6 +101,12 @@ const MAX_THUMBS: usize = 240;
 /// How long a resize has to settle before the window size is saved and a
 /// sharper decode is considered — a drag produces a resize per frame.
 const RESIZE_SETTLE_MS: u64 = 400;
+/// How long a zoom or a pan has to settle before a sharper piece of the
+/// picture is decoded. Each one is a whole decode of the file
+/// (`hyprforge_media::detail`), so a wheel spun through ten steps should
+/// ask once, at the end — and soon enough after it that the picture
+/// sharpens while it is still being looked at.
+const DETAIL_SETTLE_MS: u64 = 250;
 /// Wheel pixels per zoom step, for a touchpad's smooth scrolling.
 const PIXELS_PER_ZOOM_STEP: f32 = 60.0;
 /// How often a model on screen is checked for a newer file on disk. A
@@ -212,6 +218,7 @@ fn main() -> iced::Result {
         cursor: None,
         scroll_pixels: 0.0,
         resize_generation: 0,
+        detail_generation: 0,
         thumbs: HashMap::new(),
         thumbs_wanted: HashSet::new(),
         current_bytes: None,
@@ -326,6 +333,20 @@ struct Shown {
     /// behind the film for iced's software renderer, where a film draws
     /// nothing.
     animation: Option<Playing>,
+    /// A sharper piece of the picture, once zoomed in past what the
+    /// decode above can show — laid over it where it belongs.
+    detail: Option<Sharp>,
+}
+
+/// Part of the picture decoded at the density it is drawn at
+/// (`hyprforge_media::detail`).
+struct Sharp {
+    /// Where it belongs, in the picture's pixels with the user's turns
+    /// applied — the space [`Shown::size`] is in.
+    region: Region,
+    /// Physical pixels per picture pixel it holds.
+    density: f32,
+    handle: image::Handle,
 }
 
 /// An animation on screen: its frames as decoded, kept so a turn can
@@ -452,6 +473,9 @@ struct App {
     /// Smooth-scroll pixels not yet worth a zoom step.
     scroll_pixels: f32,
     resize_generation: u64,
+    /// Bumped by every change to what is on screen, so a sharper piece
+    /// asked for before it is dropped rather than laid over the wrong view.
+    detail_generation: u64,
     /// Thumbnails for the filmstrip, the grid and the library covers:
     /// `None` for one that could not be made. Capped at [`MAX_THUMBS`].
     thumbs: HashMap<PathBuf, Option<image::Handle>>,
@@ -539,6 +563,9 @@ enum Message {
     ToggleZoom,
     Resized(Size),
     ResizeSettled(u64),
+    /// A zoom or a pan has stood still long enough to sharpen.
+    DetailSettled(u64),
+    Detailed(PathBuf, u64, Result<Arc<Detail>, String>),
     ToggleMenu,
     MenuAction(Action),
     Tick(Instant),
@@ -853,7 +880,7 @@ impl App {
                         self.cache.put(&path, decoded.clone());
                         if self.current_path().as_deref() == Some(path.as_path()) {
                             self.present(path, decoded);
-                            return self.animate();
+                            return Task::batch([self.animate(), self.settle_detail()]);
                         }
                     }
                     Err(e) => {
@@ -957,6 +984,7 @@ impl App {
                         let at = self.cursor.unwrap_or(Point::new(viewport.width / 2.0, viewport.height / 2.0));
                         self.transform.zoom_about(steps, LogicalPoint { x: at.x, y: at.y }, shown.size, viewport);
                     }
+                    return self.settle_detail();
                 }
                 Task::none()
             }
@@ -979,7 +1007,7 @@ impl App {
             }
             Message::DragEnd => {
                 self.dragging = None;
-                Task::none()
+                self.settle_detail()
             }
             Message::ToggleZoom => {
                 if self.transform == Transform::default() {
@@ -987,7 +1015,7 @@ impl App {
                 } else {
                     self.transform.fit();
                 }
-                Task::none()
+                self.settle_detail()
             }
             Message::Resized(size) => {
                 self.window_size = size;
@@ -1016,7 +1044,36 @@ impl App {
                         p.window_height = height;
                     });
                 }
-                Task::batch([self.sharpen_if_needed(), self.request_thumbs()])
+                Task::batch([self.sharpen_if_needed(), self.request_thumbs(), self.settle_detail()])
+            }
+            Message::DetailSettled(generation) => {
+                if generation != self.detail_generation {
+                    return Task::none();
+                }
+                self.decode_detail(generation)
+            }
+            Message::Detailed(path, generation, result) => {
+                if generation != self.detail_generation {
+                    return Task::none();
+                }
+                let turns = self.turns;
+                let Some(shown) = self.shown.as_mut().filter(|s| s.path == path) else { return Task::none() };
+                match result {
+                    Ok(detail) => {
+                        let (pixels, width, height) =
+                            rotate_rgba(&detail.pixels, detail.size.width, detail.size.height, turns);
+                        let (w, h) = detail.measured.display_size();
+                        shown.detail = Some(Sharp {
+                            region: turn_region(detail.region, w, h, turns),
+                            density: detail.size.width as f32 / detail.region.width as f32,
+                            handle: image::Handle::from_rgba(width, height, pixels),
+                        });
+                    }
+                    // The picture is on screen, only softer than it could
+                    // be: a line in the log, not a sentence over it.
+                    Err(e) => tracing::warn!(path = %path.display(), error = %e, "couldn't decode a sharper piece"),
+                }
+                Task::none()
             }
             Message::ToggleMenu => {
                 self.menu_open = !self.menu_open;
@@ -1671,7 +1728,11 @@ impl App {
             decoded,
             size: ImageSize { width: source_w as f32, height: source_h as f32 },
             animation,
+            detail: None,
         });
+        // A piece asked for the picture this replaces would be laid over
+        // the wrong pixels — a turn moves every one of them.
+        self.detail_generation += 1;
     }
 
     /// Decodes the frames of the picture on screen, when it is a GIF and
@@ -1751,6 +1812,61 @@ impl App {
             return self.redecode_current();
         }
         Task::none()
+    }
+
+    /// The sharper piece the view on screen wants, if it wants one.
+    fn detail_wanted(&self) -> Option<hyprforge_media::detail::Wanted> {
+        let shown = self.shown.as_ref()?;
+        if self.mode != Mode::Photo || self.current_path().as_deref() != Some(shown.path.as_path()) {
+            return None;
+        }
+        let (display_w, _) = shown.decoded.measured.display_size();
+        let decoded_density = shown.decoded.size.width as f32 / display_w.max(1) as f32;
+        hyprforge_media::detail::wanted(&self.transform, shown.size, self.viewport(), self.scale_factor, decoded_density)
+    }
+
+    /// After anything moves the picture: drops a piece the view no longer
+    /// needs, keeps one that still covers it, and otherwise asks for a
+    /// new one once the view stands still.
+    fn settle_detail(&mut self) -> Task<Message> {
+        self.detail_generation += 1;
+        let generation = self.detail_generation;
+        let Some(wanted) = self.detail_wanted() else {
+            // Back at fit, or never past it: the piece is memory nothing
+            // on screen is using.
+            if let Some(shown) = self.shown.as_mut() {
+                shown.detail = None;
+            }
+            return Task::none();
+        };
+        let held = self.shown.as_ref().and_then(|s| s.detail.as_ref());
+        if held.is_some_and(|d| wanted.met_by(d.region, d.density)) {
+            return Task::none();
+        }
+        Task::perform(tokio::time::sleep(Duration::from_millis(DETAIL_SETTLE_MS)), move |_| {
+            Message::DetailSettled(generation)
+        })
+    }
+
+    fn decode_detail(&mut self, generation: u64) -> Task<Message> {
+        let (Some(wanted), Some(shown)) = (self.detail_wanted(), self.shown.as_ref()) else { return Task::none() };
+        // Asked of the file the way it presents itself: the user's turns
+        // are this window's, and undone here, then done again to the
+        // pixels that come back.
+        let region = unturn_region(wanted.region, shown.size.width as u32, shown.size.height as u32, self.turns);
+        let (path, budget, density) = (shown.path.clone(), self.budget(), wanted.density);
+        Task::perform(
+            async move {
+                let for_task = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    decode_region(&for_task, region, density, &budget).map(Arc::new).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("The decoder stopped unexpectedly: {e}")));
+                (path, result)
+            },
+            move |(path, result)| Message::Detailed(path, generation, result),
+        )
     }
 
     // --- thumbnails ------------------------------------------------------
@@ -1889,9 +2005,16 @@ impl App {
                     let steps = if action == Action::ZoomIn { 1 } else { -1 };
                     self.transform.zoom_by(steps, shown.size, viewport);
                 }
+                return self.settle_detail();
             }
-            Action::ZoomFit => self.transform.fit(),
-            Action::ZoomActual => self.transform.actual_size(),
+            Action::ZoomFit => {
+                self.transform.fit();
+                return self.settle_detail();
+            }
+            Action::ZoomActual => {
+                self.transform.actual_size();
+                return self.settle_detail();
+            }
             Action::RotateLeft | Action::RotateRight => {
                 self.turns = if action == Action::RotateRight { self.turns.right() } else { self.turns.left() };
                 self.transform.fit();
@@ -2063,7 +2186,7 @@ impl App {
     fn set_window_mode(&mut self) -> Task<Message> {
         self.transform.fit();
         self.size_video();
-        let redecode = self.sharpen_if_needed();
+        let redecode = Task::batch([self.sharpen_if_needed(), self.settle_detail()]);
         let mode = match self.window {
             Some(id) => window::set_mode(
                 id,

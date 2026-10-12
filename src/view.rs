@@ -313,7 +313,25 @@ impl App {
                 iced::widget::shader(playing.film.program()).width(Length::Fixed(w)).height(Length::Fixed(h)),
             ]
             .into(),
-            None => still.into(),
+            None => match &shown.detail {
+                // The sharper piece over the enlarged picture, where it
+                // belongs: the picture's pixels times the scale it is
+                // drawn at. The picture stays underneath, so a pan past
+                // the piece shows it softer rather than not at all.
+                Some(sharp) => {
+                    let scale = w / shown.size.width.max(1.0);
+                    let r = sharp.region;
+                    let piece = image(sharp.handle.clone())
+                        .width(Length::Fixed(r.width as f32 * scale))
+                        .height(Length::Fixed(r.height as f32 * scale))
+                        .content_fit(iced::ContentFit::Fill);
+                    stack![still, pin(piece).x(r.x as f32 * scale).y(r.y as f32 * scale)]
+                        .width(Length::Fixed(w))
+                        .height(Length::Fixed(h))
+                        .into()
+                }
+                None => still.into(),
+            },
         }
     }
 

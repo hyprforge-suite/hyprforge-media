@@ -15,7 +15,10 @@ what was looked at.
 
 Pictures are decoded **within a budget** and orientation-correct, through
 `hyprforge-image`; a 36-megapixel file is measured before it is decoded,
-not after. An animated GIF plays, every frame together inside what one
+not after. Zoomed in past what was decoded, the part on screen is
+decoded again at the density it is drawn at, once the zoom settles, so
+1:1 shows the file's own pixels without the whole file being kept at
+full size. An animated GIF plays, every frame together inside what one
 still may keep; zoomed in past the window it stands still on its first
 frame, and plays again on the way out. Videos play through libmpv, opened at run time rather than
 linked, so a machine without mpv still runs the viewer and a video says
