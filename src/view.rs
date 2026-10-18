@@ -1190,17 +1190,10 @@ fn sidebar_row<'a>(
         .into()
 }
 
-/// The show/hide control for the sidebar, filled while it shows — the
-/// file manager's `sidebar_toggle`, idiom for idiom.
+/// The show/hide control for the sidebar, filled while it shows: the
+/// suite's own, as Files and Processes draw it.
 fn sidebar_toggle<'a>(shown: bool, scale: FontScale) -> Element<'a, Message> {
-    let side = density::glyph_button(scale);
-    button(container(glyph::sidebar(side, theme::text())).center_x(Length::Fill).center_y(Length::Fill))
-        .width(Length::Fixed(side))
-        .height(Length::Fixed(side))
-        .padding(0)
-        .on_press(Message::Perform(Action::ToggleSidebar))
-        .style(move |_t: &Theme, status| filled_button(shown, status, true))
-        .into()
+    hyprforge_ui::widgets::sidebar_toggle(shown, Message::Perform(Action::ToggleSidebar), scale)
 }
 
 /// Back and forward, drawn marks in fixed squares. `fills` is whether the
