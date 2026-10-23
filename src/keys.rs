@@ -380,6 +380,35 @@ pub type Keymap = hyprforge_keys::Keymap<Action>;
 /// What a key press turned out to mean here.
 pub type Resolved = hyprforge_keys::Resolved<Action>;
 
+impl Action {
+    /// Whether holding the key does this again on every auto-repeat.
+    ///
+    /// Yes for everything that only moves or changes the view — a held
+    /// Right pages on, a held `+` keeps zooming, which is what people
+    /// hold them for. No for what reaches outside the window: a held
+    /// Delete trashed one picture per repeat, each the next one to slide
+    /// into view, and a held Shift+Enter would open a player per repeat.
+    /// Those happen once per press, however long the press.
+    pub fn repeats(self) -> bool {
+        !matches!(
+            self,
+            Action::Trash | Action::SetWallpaper | Action::Copy | Action::OpenExternally | Action::ShowInFiles
+        )
+    }
+}
+
+/// The action a key press asks for, or `None` — `repeat` being whether
+/// the press is the keyboard's auto-repeat (`hyprforge_ui::keys::is_repeat`).
+///
+/// Nothing here takes typing (see [`BARE_KEYS`]), so a press that
+/// resolves to text does nothing either.
+pub fn acted_on(keymap: &Keymap, press: &hyprforge_keys::KeyPress, repeat: bool) -> Option<Action> {
+    match keymap.resolve(press) {
+        Some(Resolved::Action(action)) if !repeat || action.repeats() => Some(action),
+        _ => None,
+    }
+}
+
 pub fn defaults() -> Keymap {
     Keymap::defaults(BARE_KEYS)
 }
@@ -450,6 +479,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Holding Delete sends one press and then the keyboard's repeats.
+    /// Each repeat used to trash whichever picture had just slid into
+    /// view, so a held key emptied the folder one file at a time.
+    #[test]
+    fn a_repeated_delete_press_trashes_nothing_beyond_the_first() {
+        let keys = defaults();
+        assert_eq!(acted_on(&keys, &press("Delete"), false), Some(Action::Trash));
+        assert_eq!(acted_on(&keys, &press("Delete"), true), None);
+    }
+
+    /// The same for everything that reaches outside the window: a held
+    /// Shift+Enter is not a request for twenty video players.
+    #[test]
+    fn nothing_that_reaches_outside_the_window_repeats() {
+        for action in [Action::Trash, Action::SetWallpaper, Action::Copy, Action::OpenExternally, Action::ShowInFiles]
+        {
+            assert!(!action.repeats(), "{action:?}");
+        }
+    }
+
+    /// And holding a key that only moves or looks still does what it
+    /// always did — paging on, zooming further.
+    #[test]
+    fn a_held_arrow_still_pages_on() {
+        let keys = defaults();
+        assert_eq!(acted_on(&keys, &press("Right"), true), Some(Action::Next));
+        assert_eq!(acted_on(&keys, &press("Plus"), true), Some(Action::ZoomIn));
     }
 
     /// The reason `BareKeys` exists, from this side: the keys people

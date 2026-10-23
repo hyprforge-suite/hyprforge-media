@@ -1013,7 +1013,7 @@ impl App {
         let sidebar = if self.sidebar_on() { "Hide Sidebar" } else { "Show Sidebar" };
         let menu = column![
             entry(Action::Slideshow.label().to_string(), Action::Slideshow, !self.folder.is_empty()),
-            entry(Action::SetWallpaper.label().to_string(), Action::SetWallpaper, has),
+            entry(Action::SetWallpaper.label().to_string(), Action::SetWallpaper, self.wallpaper_candidate().is_some()),
             entry(Action::Copy.label().to_string(), Action::Copy, has),
             entry(Action::OpenExternally.label().to_string(), Action::OpenExternally, has),
             entry(Action::ShowInFiles.label().to_string(), Action::ShowInFiles, has),

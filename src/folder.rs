@@ -233,6 +233,29 @@ impl Folder {
             self.cursor = self.items.len().saturating_sub(1);
         }
     }
+
+    /// Drops the item at `path`, wherever the cursor is, and hands it
+    /// back — what a finished trash leaves behind.
+    ///
+    /// By path rather than "the current one" because a trash finishes
+    /// after the key that asked for it: page on while it runs and the
+    /// current item is a different file, which then lost its place in
+    /// the folder while the one actually trashed stayed listed. The
+    /// cursor keeps the picture it was on; when that is the one removed,
+    /// the next slides in, as [`Folder::remove_current`] does.
+    pub fn remove(&mut self, path: &Path) -> Option<Item> {
+        let index = self.items.iter().position(|i| i.path == path)?;
+        if index == self.cursor {
+            let item = self.items[index].clone();
+            self.remove_current();
+            return Some(item);
+        }
+        let item = self.items.remove(index);
+        if index < self.cursor {
+            self.cursor -= 1;
+        }
+        Some(item)
+    }
 }
 
 #[cfg(test)]
@@ -414,6 +437,35 @@ mod tests {
         assert_eq!(f.current().unwrap().name, "b.jpg");
         f.remove_current();
         assert_eq!(f.current().unwrap().name, "c.jpg");
+    }
+
+    /// A trash finishes after the key that asked for it, and the user
+    /// may have paged on meanwhile. What comes out is the file that was
+    /// trashed, and the picture on screen stays on screen.
+    #[test]
+    fn removing_a_picture_behind_the_cursor_keeps_the_one_showing() {
+        let mut f = folder(&["a.jpg", "b.jpg", "c.jpg"]);
+        f.last();
+        let removed = f.remove(Path::new("/photos/a.jpg")).unwrap();
+        assert_eq!(removed.name, "a.jpg");
+        assert_eq!(f.current().unwrap().name, "c.jpg");
+        let names: Vec<&str> = f.items().iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["b.jpg", "c.jpg"]);
+    }
+
+    #[test]
+    fn removing_the_picture_showing_by_path_shows_the_next_one() {
+        let mut f = folder(&["a.jpg", "b.jpg", "c.jpg"]);
+        f.next();
+        assert_eq!(f.remove(Path::new("/photos/b.jpg")).unwrap().name, "b.jpg");
+        assert_eq!(f.current().unwrap().name, "c.jpg");
+    }
+
+    #[test]
+    fn removing_a_path_that_is_not_here_removes_nothing() {
+        let mut f = folder(&["a.jpg", "b.jpg"]);
+        assert_eq!(f.remove(Path::new("/elsewhere/a.jpg")), None);
+        assert_eq!(f.len(), 2);
     }
 
     #[test]

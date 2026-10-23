@@ -45,7 +45,7 @@ use hyprforge_media::args::{self, Args};
 use hyprforge_media::cache::Cache;
 use hyprforge_media::folder::{Folder, Media};
 use hyprforge_media::history::History;
-use hyprforge_media::keys::{Action, Resolved};
+use hyprforge_media::keys::{self, Action};
 use hyprforge_media::library::Summary;
 use hyprforge_media::rotation::{rotate_rgba, turn_region, unturn_region, Turns};
 use hyprforge_mesh::camera::ViewPoint;
@@ -431,6 +431,24 @@ struct ModelView {
 /// folder of models load forty meshes into memory at once.
 static EXPENSIVE_THUMBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+/// How many stills are decoded for the grid at once.
+const STILL_THUMB_SLOTS: usize = 4;
+
+/// Stills too: each decode holds the whole picture while it shrinks it —
+/// a 36-megapixel photograph is well over 100MB — and with no limit a
+/// screenful of them was decoded all at once, one blocking thread per
+/// tile. Their own slots, so a tile of a photograph never waits behind a
+/// video's ffmpeg.
+static STILL_THUMBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(STILL_THUMB_SLOTS);
+
+/// The slots a thumbnail of `media` takes one of while it is made.
+fn thumb_slots(media: Media) -> &'static tokio::sync::Semaphore {
+    match media {
+        Media::Still => &STILL_THUMBS,
+        Media::Clip | Media::Model => &EXPENSIVE_THUMBS,
+    }
+}
+
 /// The compact viewer's panels: off until asked for, and not saved — a
 /// panel opened in a glance is not a preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,7 +581,9 @@ enum Message {
     NextFrame,
     Details(PathBuf, Option<Measured>, Camera),
     Thumb(PathBuf, Option<image::Handle>),
-    Key(hyprforge_keys::KeyPress),
+    /// A key press, and whether it is the keyboard's auto-repeat — which
+    /// `hyprforge_keys::KeyPress` has no field for, so it travels beside it.
+    Key(hyprforge_keys::KeyPress, bool),
     Perform(Action),
     /// A single click on a filmstrip tile or a grid tile.
     Select(usize),
@@ -646,7 +666,10 @@ impl App {
             None => Subscription::none(),
         };
         Subscription::batch([
-            keyboard::listen().filter_map(|event| hyprforge_ui::keys::key_press(&event).map(Message::Key)),
+            keyboard::listen().filter_map(|event| {
+                let repeat = hyprforge_ui::keys::is_repeat(&event);
+                hyprforge_ui::keys::key_press(&event).map(|press| Message::Key(press, repeat))
+            }),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
             tick,
             watch,
@@ -950,10 +973,11 @@ impl App {
                 self.thumbs.insert(path, handle);
                 Task::none()
             }
-            Message::Key(press) => match self.keymap.resolve(&press) {
-                Some(Resolved::Action(action)) => self.perform(action),
-                // Nowhere here takes typing — see `keys::BARE_KEYS`.
-                Some(Resolved::Text(_)) | None => Task::none(),
+            // A repeat of a key that trashes or reaches outside the window
+            // is dropped there — see `Action::repeats`.
+            Message::Key(press, repeat) => match keys::acted_on(&self.keymap, &press, repeat) {
+                Some(action) => self.perform(action),
+                None => Task::none(),
             },
             Message::Perform(action) => self.perform(action),
             Message::Select(index) => {
@@ -991,6 +1015,9 @@ impl App {
             }
             Message::Scrolled(delta) => {
                 let steps = match delta {
+                    // Not `signum` alone: `0.0f32.signum()` is `1.0`, so a
+                    // wheel tilted sideways — all `x` — zoomed in.
+                    mouse::ScrollDelta::Lines { y: 0.0, .. } => 0,
                     mouse::ScrollDelta::Lines { y, .. } => y.signum() as i32,
                     mouse::ScrollDelta::Pixels { y, .. } => {
                         self.scroll_pixels += y;
@@ -1219,10 +1246,14 @@ impl App {
             }
             Message::Trashed(path, result) => match result {
                 Ok(item) => {
-                    let name = self.folder.current().map(|i| i.name.clone()).unwrap_or_default();
-                    if self.current_path().as_deref() == Some(path.as_path()) {
-                        self.folder.remove_current();
-                    }
+                    // By the path that was trashed, never the cursor: a
+                    // trash finishes after the key that asked for it, and
+                    // a picture paged to meanwhile was named in the notice
+                    // and the Undo while the trashed one stayed listed.
+                    let name = match self.folder.remove(&path) {
+                        Some(removed) => removed.name,
+                        None => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    };
                     self.cache.remove(&path);
                     self.thumbs.remove(&path);
                     self.notice = Some(format!("Moved {name} to the trash."));
@@ -1954,7 +1985,7 @@ impl App {
                 let cache = self.thumb_cache.clone();
                 tasks.push(Task::perform(
                     async move {
-                        let _slot = EXPENSIVE_THUMBS.acquire().await;
+                        let _slot = thumb_slots(media).acquire().await;
                         let for_task = path.clone();
                         let handle = tokio::task::spawn_blocking(move || {
                             hyprforge_media::thumbs::of(cache.as_deref(), &for_task, media)
@@ -1971,6 +2002,7 @@ impl App {
             }
             tasks.push(Task::perform(
                 async move {
+                    let _slot = thumb_slots(Media::Still).acquire().await;
                     let for_task = path.clone();
                     let handle = tokio::task::spawn_blocking(move || {
                         decode_to_fit(&for_task, &Budget::for_edge(edge))
@@ -2339,22 +2371,28 @@ impl App {
     /// it, so closing the viewer ends the copy unless something else (the
     /// clipboard daemon, when it is running) has taken it up.
     fn copy(&mut self) -> Task<Message> {
-        let Some(path) = self.current_path() else { return Task::none() };
+        let Some((path, media)) = self.folder.current().map(|i| (i.path.clone(), i.media)) else {
+            return Task::none();
+        };
         let writer = self.clipboard.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let bytes = std::fs::read(&path).map_err(|e| format!("Couldn't read the picture to copy it: {e}"))?;
-                    let mime = hyprforge_mime::MimeDb::load()
-                        .type_of(&path)
-                        .unwrap_or("application/octet-stream")
-                        .to_string();
                     let uri = format!("file://{}", path.display());
-                    let offers = hyprforge_clipboard::Offers::new(vec![
-                        (hyprforge_clipboard::Mime::new(mime), bytes),
-                        (hyprforge_clipboard::Mime::new("text/uri-list"), format!("{uri}\r\n").into_bytes()),
-                        (hyprforge_clipboard::Mime::new("text/plain"), path.display().to_string().into_bytes()),
-                    ]);
+                    let mut offers = Vec::new();
+                    // The picture's own bytes only for a still under the
+                    // cap — see `bytes_to_copy`. The location is offered
+                    // either way.
+                    if let Some(bytes) = bytes_to_copy(&path, media, COPY_BYTES)? {
+                        let mime = hyprforge_mime::MimeDb::load()
+                            .type_of(&path)
+                            .unwrap_or("application/octet-stream")
+                            .to_string();
+                        offers.push((hyprforge_clipboard::Mime::new(mime), bytes));
+                    }
+                    offers.push((hyprforge_clipboard::Mime::new("text/uri-list"), format!("{uri}\r\n").into_bytes()));
+                    offers.push((hyprforge_clipboard::Mime::new("text/plain"), path.display().to_string().into_bytes()));
+                    let offers = hyprforge_clipboard::Offers::new(offers);
                     writer
                         .set_offers(offers)
                         // The source stays alive on the writer's own
@@ -2375,7 +2413,13 @@ impl App {
     /// never around them: saved first, then pushed to hyprpaper, so the
     /// choice survives a restart and Settings shows what is on screen.
     fn set_wallpaper(&mut self) -> Task<Message> {
-        let Some(path) = self.current_path() else { return Task::none() };
+        let Some(path) = self.wallpaper_candidate() else {
+            // Said rather than silent: the key was pressed on something.
+            if self.folder.current().is_some() {
+                self.notice = Some(NOT_A_WALLPAPER.to_string());
+            }
+            return Task::none();
+        };
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || set_wallpaper(&path))
@@ -2384,6 +2428,15 @@ impl App {
             },
             Message::Done,
         )
+    }
+
+    /// The current item, if it can be a wallpaper: a still. hyprpaper
+    /// draws pictures, and `set_wallpaper` saves the choice for every
+    /// monitor *before* hyprpaper is asked — so a video or a model went
+    /// into the settings and replaced every wallpaper, and was refused
+    /// only afterwards. The menu greys the entry out on the same answer.
+    fn wallpaper_candidate(&self) -> Option<PathBuf> {
+        self.folder.current().filter(|i| i.media == Media::Still).map(|i| i.path.clone())
     }
 
     fn trash(&mut self) -> Task<Message> {
@@ -2478,6 +2531,39 @@ fn save_pref(change: impl FnOnce(&mut prefs::Prefs)) {
     if let Err(e) = prefs::update(change) {
         tracing::warn!(error = %e, "viewer setting not saved");
     }
+}
+
+/// What Set as Wallpaper says on a video or a model.
+const NOT_A_WALLPAPER: &str = "Only a picture can be the wallpaper.";
+
+/// The largest picture Copy puts on the clipboard as its own bytes. The
+/// bytes are read into memory and held for as long as the copy lasts;
+/// past this, and for anything that is not a still, the file goes on the
+/// clipboard as its location only — which is what a file manager, a
+/// terminal or a chat window pastes anyway.
+const COPY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The bytes to offer for `path` under its own type, or `None` to offer
+/// only its location. A clip or a model is not opened at all: nothing
+/// pastes a video as bytes, and reading one meant holding gigabytes.
+fn bytes_to_copy(path: &Path, media: Media, most: u64) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    if media != Media::Still {
+        return Ok(None);
+    }
+    let read = |e: std::io::Error| format!("Couldn't read the picture to copy it: {e}");
+    let file = std::fs::File::open(path).map_err(read)?;
+    if file.metadata().map_err(read)?.len() > most {
+        return Ok(None);
+    }
+    // Bounded again while reading, against a file that grew since the
+    // `metadata` above: one byte past the cap is enough to know.
+    let mut bytes = Vec::new();
+    file.take(most.saturating_add(1)).read_to_end(&mut bytes).map_err(read)?;
+    if bytes.len() as u64 > most {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// Saves `picture` as the wallpaper on every monitor and pushes it to
@@ -2625,6 +2711,21 @@ mod picture_tests {
         assert_quadrants(&app, &image, scale, [TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT]);
     }
 
+    /// `f32::signum(0.0)` is `1.0`, so a wheel tilted sideways — all `x`,
+    /// no `y` — used to zoom in. The second half checks the rig: a real
+    /// vertical notch does move the picture, so the first assertion is
+    /// not passing because nothing could have changed.
+    #[test]
+    fn a_sideways_wheel_tilt_does_not_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = showing(&quadrants(dir.path(), 200, 100), Turns::none());
+        let before = app.transform;
+        let _ = app.update(Message::Scrolled(mouse::ScrollDelta::Lines { x: 1.0, y: 0.0 }));
+        assert_eq!(app.transform, before);
+        let _ = app.update(Message::Scrolled(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 }));
+        assert_ne!(app.transform, before);
+    }
+
     /// A turn to the right moves the top-left quadrant to the top right,
     /// as it does on screen — not merely a picture of the turned shape.
     #[test]
@@ -2652,5 +2753,99 @@ mod picture_tests {
         let top = app.transform.top_left(shown.size, viewport).y;
         let got = rgb_at(&image, viewport.width / 2.0 * scale, top / 2.0 * scale);
         assert!(close(got, want), "{got:?}, want the theme's {want:?}");
+    }
+}
+
+/// What the actions on the current item do to the window, without a
+/// window: the decisions, and the state they leave behind.
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+
+    /// A window open on `dir`, holding `names` — real, tiny PNGs for the
+    /// `.png`s, a byte of nothing for the rest — at the first of them.
+    fn open_on(dir: &Path, names: &[&str]) -> App {
+        for name in names {
+            let path = dir.join(name);
+            if name.ends_with(".png") {
+                ::image::RgbaImage::from_pixel(2, 2, ::image::Rgba([10, 20, 30, 255])).save(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"x").unwrap();
+            }
+        }
+        let mut app = App::blank(Size::new(900.0, 700.0));
+        app.folder_path = Some(dir.to_path_buf());
+        app.folder = Folder::build(StdBackend.read_dir(dir).unwrap(), &app.order);
+        app
+    }
+
+    fn trashed(path: &Path) -> hyprforge_fileops::trash::TrashedItem {
+        hyprforge_fileops::trash::TrashedItem {
+            original_path: path.to_path_buf(),
+            deleted_at: "2026-10-22T03:00:00".to_string(),
+            trashed_file: PathBuf::from("/nowhere/files/x"),
+            info_file: PathBuf::from("/nowhere/info/x.trashinfo"),
+        }
+    }
+
+    /// Delete on `a`, then Right before the trash came back: the notice
+    /// and the Undo name `a`, `a` leaves the folder, and `b` — the one
+    /// on screen — stays. Read from the cursor, all three were `b`.
+    #[test]
+    fn a_trash_that_finishes_after_paging_on_names_and_removes_the_file_trashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = open_on(dir.path(), &["a.png", "b.png", "c.png"]);
+        let a = dir.path().join("a.png");
+        app.folder.next();
+        let _ = app.update(Message::Trashed(a.clone(), Ok(trashed(&a))));
+        assert_eq!(app.notice.as_deref(), Some("Moved a.png to the trash."));
+        assert!(matches!(&app.undo, Some(Undo::Trashed { name, .. }) if name == "a.png"));
+        assert_eq!(app.current_path(), Some(dir.path().join("b.png")));
+        let names: Vec<&str> = app.folder.items().iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["b.png", "c.png"]);
+    }
+
+    /// hyprpaper shows pictures. A video or a model handed to it used to
+    /// be saved as every monitor's wallpaper first and refused after.
+    #[test]
+    fn only_a_still_can_be_made_the_wallpaper() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = open_on(dir.path(), &["a.png", "b.mp4", "c.stl"]);
+        assert_eq!(app.wallpaper_candidate(), Some(dir.path().join("a.png")));
+        app.folder.next();
+        assert_eq!(app.wallpaper_candidate(), None);
+        let _ = app.perform(Action::SetWallpaper);
+        assert_eq!(app.notice.as_deref(), Some(NOT_A_WALLPAPER));
+        app.folder.next();
+        assert_eq!(app.wallpaper_candidate(), None);
+    }
+
+    /// Ctrl+C on a four-gigabyte video read all of it into memory to
+    /// offer it as bytes nothing would paste. Only a still under the cap
+    /// is read; anything else goes on the clipboard as its location.
+    #[test]
+    fn copying_reads_only_a_still_under_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.png");
+        std::fs::write(&small, [7u8; 10]).unwrap();
+        assert_eq!(bytes_to_copy(&small, Media::Still, 10).unwrap(), Some(vec![7u8; 10]));
+        assert_eq!(bytes_to_copy(&small, Media::Still, 9).unwrap(), None);
+        // Not even opened: a clip or a model that is not there at all is
+        // still no error, because nothing tried to read it.
+        let absent = dir.path().join("absent.mp4");
+        assert_eq!(bytes_to_copy(&absent, Media::Clip, u64::MAX).unwrap(), None);
+        assert_eq!(bytes_to_copy(&absent, Media::Model, u64::MAX).unwrap(), None);
+    }
+
+    /// A grid scrolled onto a screenful of large photographs decoded every
+    /// tile at once; each decode holds the whole picture while it runs.
+    #[test]
+    fn still_thumbnails_are_decoded_a_few_at_a_time() {
+        let slots = thumb_slots(Media::Still);
+        let held: Vec<_> = (0..STILL_THUMB_SLOTS).map(|_| slots.try_acquire().unwrap()).collect();
+        assert!(slots.try_acquire().is_err());
+        // And a still never queues behind a video's ffmpeg.
+        assert!(!std::ptr::eq(slots, thumb_slots(Media::Clip)));
+        drop(held);
     }
 }
