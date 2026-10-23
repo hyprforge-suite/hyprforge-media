@@ -25,6 +25,17 @@ use std::path::Path;
 /// it is never recorded as one: the same video may thumbnail fine once
 /// ffmpeg is installed.
 pub fn of(cache: Option<&Cache>, path: &Path, media: Media) -> Option<Rgba> {
+    of_within(cache, path, media, MODEL_BYTES)
+}
+
+/// The largest model file thumbnailed: the file manager's own cap
+/// (`MODEL_BYTES` in `hyprforge-files`' preview), since both draw into the
+/// one cache. A welded mesh in memory is several times its file, and a
+/// grid scrolled past a folder of print files would otherwise load every
+/// one of them whole, however large.
+pub const MODEL_BYTES: u64 = 64 * 1024 * 1024;
+
+fn of_within(cache: Option<&Cache>, path: &Path, media: Media, model_bytes: u64) -> Option<Rgba> {
     let stamp = Stamp::of(path).ok();
     if let (Some(cache), Some(stamp)) = (cache, stamp) {
         match cache.get_sized(Size::Large, path, stamp) {
@@ -39,6 +50,10 @@ pub fn of(cache: Option<&Cache>, path: &Path, media: Media) -> Option<Rgba> {
             Ok(None) => Made::Failed,
             Err(_) => Made::NoVerdict,
         },
+        // Too large is not a verdict on the file — the tile keeps its
+        // badge and the model still opens — so it is not recorded as a
+        // failure, as Files does not record it either.
+        Media::Model if std::fs::metadata(path).map_or(true, |m| m.len() > model_bytes) => Made::NoVerdict,
         Media::Model => match hyprforge_mesh::load(path, true) {
             Ok((mesh, _)) => {
                 let img = hyprforge_mesh::thumbnail::render(&mesh, Size::Large.edge());
@@ -125,6 +140,18 @@ mod tests {
         std::fs::write(&broken, b"not a zip").unwrap();
         assert!(of(Some(&cache), &broken, Media::Model).is_none());
         assert_eq!(cache.get_sized(Size::Large, &broken, Stamp::of(&broken).unwrap()), Lookup::Failed);
+    }
+
+    /// A model over the cap is not loaded at all — a mesh in memory is
+    /// several times its file — and not remembered as a failure either,
+    /// because nothing is wrong with the file.
+    #[test]
+    fn a_model_over_the_size_cap_is_not_loaded_and_not_blamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::at(dir.path().join("thumbnails"));
+        let model = cube_stl(dir.path());
+        assert!(of_within(Some(&cache), &model, Media::Model, 100).is_none());
+        assert_eq!(cache.get_sized(Size::Large, &model, Stamp::of(&model).unwrap()), Lookup::Missing);
     }
 
     /// With nowhere to cache, a thumbnail is still made — just every time.
