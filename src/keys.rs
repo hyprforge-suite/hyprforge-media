@@ -374,6 +374,14 @@ impl Bindable for Action {
     }
 }
 
+/// What `hyprforge-media --list-keys` prints: every action, its label and
+/// its shipped keys, and the file a rebinding goes in — so Settings'
+/// Keyboard page can offer Media's keys without linking against Media.
+/// See `hyprforge_keys::listing`.
+pub fn listing() -> hyprforge_keys::Listing {
+    hyprforge_keys::Listing::of("Media", &crate::config::path().display().to_string(), BARE_KEYS, Action::label)
+}
+
 /// The shipped keymap.
 pub type Keymap = hyprforge_keys::Keymap<Action>;
 
@@ -449,6 +457,19 @@ pub fn key_label(combo: &hyprforge_keys::Combo) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Settings shows exactly this, so every action is in it, under the
+    /// id the config file uses, and it reads back whole.
+    #[test]
+    fn the_key_listing_names_every_action_and_reads_back() {
+        let listing = listing();
+        let read = hyprforge_keys::Listing::parse(&listing.render().unwrap()).unwrap();
+        assert_eq!(read, listing);
+        assert_eq!(read.actions.len(), Action::all().len());
+        assert!(read.actions.iter().all(|a| Action::from_id(&a.id).is_some() && !a.label.is_empty()));
+        assert!(read.config.ends_with("media-config.toml"));
+    }
+
     use super::*;
     use hyprforge_keys::{Combo, KeyPress};
 

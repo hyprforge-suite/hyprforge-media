@@ -118,6 +118,18 @@ const MODEL_CHECK_EVERY: Duration = Duration::from_secs(1);
 const SLIDESHOW_CONTROLS_FOR: Duration = Duration::from_secs(2);
 
 fn main() -> iced::Result {
+    // Asked by Settings' Keyboard page, before anything opens a window.
+    if std::env::args().skip(1).any(|a| a == "--list-keys") {
+        match hyprforge_media::keys::listing().render() {
+            Ok(text) => print!("{text}"),
+            Err(e) => {
+                eprintln!("hyprforge-media: can't list the keys: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     // `warn` unless RUST_LOG says otherwise — a viewer opened from the
     // file manager has no terminal, and anything quieter would hide the
     // warning for a config file that exists and will not parse.
